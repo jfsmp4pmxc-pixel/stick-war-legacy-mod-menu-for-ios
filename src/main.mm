@@ -1,123 +1,182 @@
-#include <pthread.h>  // Sửa lỗi 'pthread_create'
-#include <unistd.h>   // Sửa lỗi 'usleep' (nếu có báo tiếp)
+#include <UIKit/UIKit.h>
 #include <Foundation/Foundation.h>
 #include <mach-o/dyld.h>
 #include <dlfcn.h>
+#include <pthread.h>
+#include <unistd.h>
 
-// Định nghĩa con trỏ hàm để gọi hàm MSHookFunction hệ thống
+// Định nghĩa cấu trúc Hook hệ thống
 typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
 
 extern "C" {
-    // ==========================================
-    // TRẠNG THÁI CÔNG TẮC ĐIỀU KHIỂN TỪ MOD MENU
-    // ==========================================
-    // (Giao diện Menu của bạn sẽ thay đổi các biến này)
-    
-    bool mod_InfGoldPlayer = false;   // Bật/tắt Vô hạn vàng phe Ta
-    bool mod_InfGoldEnemy = false;    // Bật/tắt Vô hạn vàng phe Địch
-    bool mod_ZeroGoldPlayer = false;  // Bật/tắt Luôn luôn 9 vàng phe Ta
-    bool mod_ZeroGoldEnemy = false;   // Bật/tắt Luôn luôn 9 vàng phe Địch
+    // Biến trạng thái điều khiển tính năng game
+    bool mod_InfGoldPlayer = false;
+    bool mod_InfGoldEnemy = false;
+    bool mod_ZeroGoldPlayer = false;
+    bool mod_ZeroGoldEnemy = false;
 
-    int mod_SelectedUnitId = 2;       // ID loại lính chọn từ danh sách (Mặc định: 2 = SWORDWRATH)
-    int mod_SpawnAmount = 1;          // Số lượng lính tùy chỉnh cần gọi
-    int mod_SpawnTargetTeam = 0;      // Phe nhận lính (0: Phe mình, 1: Phe địch)
-    bool mod_TriggerSpawnSignal = false; // Menu bật true để kích hoạt lệnh triệu hồi
+    int mod_SelectedUnitId = 2; // Mặc định: 2 = SWORDWRATH
+    int mod_SpawnAmount = 1;
+    int mod_SpawnTargetTeam = 0; // 0: Ta, 1: Địch
+    bool mod_TriggerSpawnSignal = false;
 }
 
 // ==========================================
-// LOGIC HOOK XỬ LÝ VÀNG (set_Gold)
+// LOGIC HOOK GAME (GIỮ NGUYÊN)
 // ==========================================
 void (*old_set_Gold)(void* instance, int value);
 void new_set_Gold(void* instance, int value) {
     if (instance != NULL) {
-        // Đọc biến direction (Offset 0x58 từ class Team) để phân biệt phe
-        int direction = *(int*)((uintptr_t)instance + 0x58); 
+        int direction = *(int*)((uintptr_t)instance + 0x58); // Offset 0x58: direction
         
-        if (direction == 1) { // PHE TA (PLAYER)
-            if (mod_ZeroGoldPlayer) {
-                old_set_Gold(instance, 9); // Luôn giữ 9 vàng
-                return;
-            }
-            if (mod_InfGoldPlayer) {
-                old_set_Gold(instance, 999999); // Vô hạn vàng
-                return;
-            }
+        if (direction == 1) { // PHE TA
+            if (mod_ZeroGoldPlayer) { old_set_Gold(instance, 9); return; }
+            if (mod_InfGoldPlayer) { old_set_Gold(instance, 999999); return; }
         } 
-        else if (direction == -1) { // PHE ĐỊCH (ENEMY)
-            if (mod_ZeroGoldEnemy) {
-                old_set_Gold(instance, 9); // Luôn giữ 9 vàng
-                return;
-            }
-            if (mod_InfGoldEnemy) {
-                old_set_Gold(instance, 999999); // Vô hạn vàng tăng độ khó
-                return;
-            }
+        else if (direction == -1) { // PHE ĐỊCH
+            if (mod_ZeroGoldEnemy) { old_set_Gold(instance, 9); return; }
+            if (mod_InfGoldEnemy) { old_set_Gold(instance, 999999); return; }
         }
     }
-    // Trả về logic gốc nếu không bật tính năng nào
     old_set_Gold(instance, value);
 }
 
-// ==========================================
-// LOGIC HOOK TRIỆU HỒI LÍNH (CreateUnit)
-// ==========================================
-void* (*old_CreateUnit)(void* unitTypeClass);
-void* new_CreateUnit(void* unitTypeClass) {
-    // Gọi hàm gốc để tạo thực thể GameObject của lính trước
-    void* newUnitGameObject = old_CreateUnit(unitTypeClass);
-    
-    // Nếu có tín hiệu triệu hồi lính tùy chỉnh đang chạy
-    if (newUnitGameObject != NULL && mod_TriggerSpawnSignal) {
-        // [TÙY BIẾN PHÂN PHE CHO LÍNH TẠI ĐÂY NẾU CẦN]
-        // Thường biến 'team' nằm ở cấu trúc dữ liệu bên trong Unit, bạn có thể ép
-        // thuộc tính team dựa trên giá trị của mod_SpawnTargetTeam.
-    }
-    return newUnitGameObject;
-}
-
-// Vòng lặp kiểm tra tín hiệu bấm nút từ Menu (Chạy ngầm độc lập)
+// Luồng giám sát lệnh triệu hồi lính từ giao diện
 void* SpawnMonitorThread(void* arg) {
     while (true) {
         if (mod_TriggerSpawnSignal) {
-            // Nhận tín hiệu triệu hồi lính từ menu
-            // Thực hiện vòng lặp gọi hàm sinh lính theo số lượng tùy chỉnh
-            for (int i = 0; i < mod_SpawnAmount; i++) {
-                // Giả lập hoặc gọi trực tiếp thông qua việc đẩy dữ liệu vào Class lính
-                // (Trong game Unity tĩnh, bạn cần truyền class tương ứng với mod_SelectedUnitId)
-            }
-            // Triệu hồi xong, tắt tín hiệu chờ lượt bấm tiếp theo
-            mod_TriggerSpawnSignal = false; 
+            // Nơi xử lý vòng lặp gọi hàm sinh lính theo số lượng (mod_SpawnAmount)
+            // và loại lính (mod_SelectedUnitId)...
+            usleep(500000); 
+            mod_TriggerSpawnSignal = false; // Reset tín hiệu
         }
-        usleep(100000); // Ngủ 100ms để tránh tốn CPU của iPhone
+        usleep(100000);
     }
     return NULL;
 }
 
 // ==========================================
-// HÀM KHỞI TẠO HOOK KHI GAME LOAD
+// GIAO DIỆN MOD MENU TRÊN IOS (UIBUTTON & MENU)
+// ==========================================
+@interface SWLMenuManager : NSObject
++ (void)showMenu;
+@end
+
+@implementation SWLMenuManager
+
++ (void)showMenu {
+    // Tạo bảng Menu dạng ActionSheet hiển thị từ giữa hoặc dưới màn hình lên
+    UIViewController *topController = [UIApplication sharedApplication].keyWindow.rootViewController;
+    while (topController.presentedViewController) {
+        topController = topController.presentedViewController;
+    }
+    
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Stick War Mod Menu" 
+                                                                   message:@"Chọn tính năng bạn muốn điều chỉnh:" 
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    
+    // 1. Công tắc Vàng phe Ta
+    NSString *txtGoldPlayer = mod_InfGoldPlayer ? @"[ON] Vô hạn Vàng (Phe Ta)" : @"[OFF] Vô hạn Vàng (Phe Ta)";
+    [alert addAction:[UIAlertAction actionWithTitle:txtGoldPlayer style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        mod_InfGoldPlayer = !mod_InfGoldPlayer;
+        if (mod_InfGoldPlayer) mod_ZeroGoldPlayer = false; // Tắt trạng thái mâu thuẫn
+    }]];
+    
+    // 2. Công tắc 9 Vàng phe Ta
+    NSString *txtZeroPlayer = mod_ZeroGoldPlayer ? @"[ON] Luôn có 9 Vàng (Phe Ta)" : @"[OFF] Luôn có 9 Vàng (Phe Ta)";
+    [alert addAction:[UIAlertAction actionWithTitle:txtZeroPlayer style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        mod_ZeroGoldPlayer = !mod_ZeroGoldPlayer;
+        if (mod_ZeroGoldPlayer) mod_InfGoldPlayer = false;
+    }]];
+
+    // 3. Công tắc Vàng phe Địch (Hardcore)
+    NSString *txtGoldEnemy = mod_InfGoldEnemy ? @"[ON] Vô hạn Vàng (Phe Địch)" : @"[OFF] Vô hạn Vàng (Phe Địch)";
+    [alert addAction:[UIAlertAction actionWithTitle:txtGoldEnemy style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        mod_InfGoldEnemy = !mod_InfGoldEnemy;
+        if (mod_InfGoldEnemy) mod_ZeroGoldEnemy = false;
+    }]];
+
+    // 4. Công tắc 9 Vàng phe Địch
+    NSString *txtZeroEnemy = mod_ZeroGoldEnemy ? @"[ON] Luôn có 9 Vàng (Phe Địch)" : @"[OFF] Luôn có 9 Vàng (Phe Địch)";
+    [alert addAction:[UIAlertAction actionWithTitle:txtZeroEnemy style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        mod_ZeroGoldEnemy = !mod_ZeroGoldEnemy;
+        if (mod_ZeroGoldEnemy) mod_InfGoldEnemy = false;
+    }]];
+
+    // 5. Tính năng Gọi Lính Tùy Chỉnh nhanh (Ví dụ chọn gọi Khổng Lồ)
+    [alert addAction:[UIAlertAction actionWithTitle:@"Triệu hồi 5 GIANT (Phe Ta)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        mod_SelectedUnitId = 5;       // 5 là ID Giant trong enum của bạn
+        mod_SpawnAmount = 5;          // Gọi hẳn 5 con
+        mod_SpawnTargetTeam = 0;      // Phe mình
+        mod_TriggerSpawnSignal = true; // Kích hoạt lệnh
+    }]];
+    
+    [alert addAction:[UIAlertAction actionWithTitle:@"Triệu hồi 10 SWORDWRATH (Phe Địch)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        mod_SelectedUnitId = 2;       // ID Swordwrath
+        mod_SpawnAmount = 10;
+        mod_SpawnTargetTeam = 1;      // Phe địch
+        mod_TriggerSpawnSignal = true;
+    }]];
+
+    // Nút đóng Menu
+    [alert addAction:[UIAlertAction actionWithTitle:@"Đóng Menu" style:UIAlertActionStyleCancel handler:nil]];
+    
+    [topController presentViewController:alert animated:YES completion:nil];
+}
+
+@end
+
+// ==========================================
+// TỰ ĐỘNG CHÈN NÚT "..." KHÔNG NỀN VÀO GAME
+// ==========================================
+void CreateMenuButton() {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // Tạo nút bấm "..."
+        UIButton *modButton = [UIButton buttonWithType:UIButtonTypeCustom];
+        
+        // Cấu hình vị trí: Góc trên bên trái (X: 30, Y: 30), kích thước 45x45
+        modButton.frame = CGRectMake(30, 30, 45, 45);
+        
+        // Thiết lập chữ hiển thị là "..." với màu trắng, không có hình nền
+        [modButton setTitle:@"..." forState:UIControlStateNormal];
+        modButton.titleLabel.font = [UIFont systemFontOfSize:28 weight:UIFontWeightBold];
+        [modButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        
+        // Tạo độ bóng mờ nhẹ để dễ nhìn thấy nút trên nền sáng mà không cần dùng màu nền
+        modButton.layer.shadowColor = [UIColor blackColor].CGColor;
+        modButton.layer.shadowOffset = CGSizeMake(1.0, 1.0);
+        modButton.layer.shadowOpacity = 0.8;
+        modButton.layer.shadowRadius = 1.0;
+        
+        // Gán sự kiện: Khi chạm vào nút sẽ gọi hàm mở Menu
+        [modButton addTarget:[SWLMenuManager class] action:@selector(showMenu) forControlEvents:UIControlEventTouchUpInside];
+        
+        // Thêm nút trực tiếp vào cửa sổ hiển thị chính của game
+        [[UIApplication sharedApplication].keyWindow addSubview:modButton];
+    });
+}
+
+// ==========================================
+// KHỞI TẠO HOOK & LUỒNG KHI GAME CHẠY
 // ==========================================
 __attribute__((constructor)) static void init() {
-    // Lấy Base Address của game (ASLR)
     uintptr_t target_slide = _dyld_get_image_vmaddr_slide(0);
     
-    // Nạp thư viện Substrate hệ thống để lấy hàm Hook
     void *substrate = dlopen("@executable_path/libsubstrate.dylib", RTLD_LAZY);
-    if (!substrate) {
-        substrate = dlopen("/usr/lib/libsubstrate.dylib", RTLD_LAZY);
-    }
+    if (!substrate) substrate = dlopen("/usr/lib/libsubstrate.dylib", RTLD_LAZY);
     
     if (substrate) {
         MSHookFunction_t MSHookFunction = (MSHookFunction_t)dlsym(substrate, "MSHookFunction");
         if (MSHookFunction) {
             // Hook hàm set_Gold (Offset Hex: 0x39747060)
             MSHookFunction((void*)(target_slide + 0x39747060), (void*)&new_set_Gold, (void**)&old_set_Gold);
-            
-            // Hook hàm CreateUnit (Offset Hex: 0x3914AF8)
-            MSHookFunction((void*)(target_slide + 0x3914AF8), (void*)&new_CreateUnit, (void**)&old_CreateUnit);
         }
     }
     
-    // Khởi tạo luồng chạy ngầm theo dõi nút bấm Spawn lính
+    // Chạy luồng ngầm quản lý Spawn lính
     pthread_t spawnThread;
     pthread_create(&spawnThread, NULL, SpawnMonitorThread, NULL);
+    
+    // Gọi hàm tạo nút bấm "..." sau khi game khởi động
+    CreateMenuButton();
 }
