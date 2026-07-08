@@ -1,3 +1,5 @@
+#include <pthread.h>  // Sửa lỗi 'pthread_create'
+#include <unistd.h>   // Sửa lỗi 'usleep' (nếu có báo tiếp)
 #include <Foundation/Foundation.h>
 #include <mach-o/dyld.h>
 #include <dlfcn.h>
