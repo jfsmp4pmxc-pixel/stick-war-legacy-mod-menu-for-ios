@@ -1,0 +1,41 @@
+name: Build iOS Dylib Tweak
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: # Cho phép bấm nút tự chạy thủ công trên giao diện Web
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+    - name: Checkout mã nguồn
+      uses: actions/checkout@v4
+
+    - name: Thiết lập iOS SDK
+      run: |
+        echo "=== Kiểm tra các SDK có sẵn ==="
+        xcrun --sdk iphoneos --show-sdk-path
+
+    - name: Biên dịch file .dylib (arm64)
+      run: |
+        mkdir -p build
+        clang++ -dynamiclib -Wall \
+          -arch arm64 \
+          -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+          -miphoneos-version-min=15.0 \
+          -framework Foundation \
+          src/main.mm \
+          -o build/StickWarMod.dylib
+
+    - name: Ký số mã nguồn (Ad-hoc Sign)
+      run: |
+        # Đảm bảo file dylib có chữ ký hợp lệ để TrollStore/iOS chấp nhận nạp vào bộ nhớ
+        codesign -s - build/StickWarMod.dylib
+
+    - name: Tải sản phẩm lên GitHub Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: StickWarMod-Dylib
+        path: build/StickWarMod.dylib
