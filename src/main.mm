@@ -127,32 +127,62 @@ void* SpawnMonitorThread(void* arg) {
 @end
 
 // ==========================================
-// TỰ ĐỘNG CHÈN NÚT "..." KHÔNG NỀN VÀO GAME
+// TỰ ĐỘNG CHÈN NÚT "..." VÀO GÓC TRÁI DƯỚI CÙNG
 // ==========================================
 void CreateMenuButton() {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // Chờ 5 giây sau khi game vào để đảm bảo Window của Unity đã dựng xong hoàn toàn
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        
+        // Lấy Cửa sổ hiển thị chính (An toàn hơn cho mọi đời iOS)
+        UIWindow *keyWindow = nil;
+        if (@available(iOS 13.0, *)) {
+            for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                if (scene.activationState == UISceneActivationStateForegroundActive) {
+                    for (UIWindow *window in scene.windows) {
+                        if (window.isKeyWindow) {
+                            keyWindow = window;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (!keyWindow) {
+            keyWindow = [UIApplication sharedApplication].keyWindow;
+        }
+        
+        if (!keyWindow) return; // Nếu chưa tìm thấy window thì thoát để tránh crash
+
         // Tạo nút bấm "..."
         UIButton *modButton = [UIButton buttonWithType:UIButtonTypeCustom];
         
-        // Cấu hình vị trí: Góc trên bên trái (X: 30, Y: 30), kích thước 45x45
-        modButton.frame = CGRectMake(30, 30, 45, 45);
+        // Lấy kích thước thực tế của màn hình (hỗ trợ cả khi xoay ngang game)
+        CGFloat screenHeight = keyWindow.bounds.size.height;
         
-        // Thiết lập chữ hiển thị là "..." với màu trắng, không có hình nền
+        // Cấu hình vị trí: Góc trái dưới cùng (Cách lề trái 25pt, Cách đáy màn hình 35pt để né vạch Home)
+        // Kích thước nút: 50x50 cho dễ chạm
+        modButton.frame = CGRectMake(25, screenHeight - 85, 50, 50);
+        
+        // Thiết lập chữ hiển thị
         [modButton setTitle:@"..." forState:UIControlStateNormal];
-        modButton.titleLabel.font = [UIFont systemFontOfSize:28 weight:UIFontWeightBold];
+        modButton.titleLabel.font = [UIFont systemFontOfSize:32 weight:UIFontWeightBold];
         [modButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         
-        // Tạo độ bóng mờ nhẹ để dễ nhìn thấy nút trên nền sáng mà không cần dùng màu nền
+        // Đổ bóng đậm hơn để hiển thị rõ trên mọi môi trường đồ họa của game
         modButton.layer.shadowColor = [UIColor blackColor].CGColor;
-        modButton.layer.shadowOffset = CGSizeMake(1.0, 1.0);
-        modButton.layer.shadowOpacity = 0.8;
-        modButton.layer.shadowRadius = 1.0;
+        modButton.layer.shadowOffset = CGSizeMake(0.0, 2.0);
+        modButton.layer.shadowOpacity = 0.9;
+        modButton.layer.shadowRadius = 2.0;
         
-        // Gán sự kiện: Khi chạm vào nút sẽ gọi hàm mở Menu
+        // Đảm bảo nút luôn nằm trên cùng các layer khác và không bị bo góc che khuất chữ
+        modButton.clipsToBounds = NO;
+        
+        // Gán sự kiện khi chạm vào nút
         [modButton addTarget:[SWLMenuManager class] action:@selector(showMenu) forControlEvents:UIControlEventTouchUpInside];
         
-        // Thêm nút trực tiếp vào cửa sổ hiển thị chính của game
-        [[UIApplication sharedApplication].keyWindow addSubview:modButton];
+        // Đưa nút lên lớp cao nhất của ứng dụng
+        [keyWindow addSubview:modButton];
+        [keyWindow bringSubviewToFront:modButton];
     });
 }
 
