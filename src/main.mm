@@ -9,6 +9,7 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/mman.h>
+#include <libkern/OSCacheControl.h>
 
 // ==========================================
 // HOOK TYPES
@@ -39,7 +40,7 @@ static int  g_getGoldCalls = 0;
 static int  g_lastDir = 0;
 static int  g_lastValue = 0;
 static int  g_lastGetValue = 0;
-static bool g_hookMethod = false;   // true = MSHook, false = inline
+static bool g_hookMethod = false;
 static bool g_hookOK = false;
 
 static NSMutableArray<NSString*> *g_logBuffer = nil;
@@ -108,13 +109,13 @@ void new_set_Population(void* this_, int value, void* method) {
 }
 
 // ==========================================
-// INLINE HOOK ARM64 QUA VM_REMAP (cho TrollStore)
+// INLINE HOOK ARM64 QUA VM_REMAP
 // ==========================================
 static bool inline_hook_arm64(void* target, void* replacement, void** orig_out) {
     const size_t PAGE = 4096;
     uintptr_t pageAddr = (uintptr_t)target & ~(uintptr_t)(PAGE - 1);
 
-    // 1. Tạo page mới RWX chứa bản copy của page gốc
+    // 1. Page mới chứa bản copy của page gốc
     void *newPage = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (newPage == MAP_FAILED) {
@@ -123,11 +124,10 @@ static bool inline_hook_arm64(void* target, void* replacement, void** orig_out) 
     }
     memcpy(newPage, (void*)pageAddr, PAGE);
 
-    // 2. Tính offset target trong page
     uintptr_t targetOffset = (uintptr_t)target - pageAddr;
     void *targetCopy = (void*)((uintptr_t)newPage + targetOffset);
 
-    // 3. Tạo trampoline: 16 byte đầu hàm gốc + jump về target+16
+    // 2. Trampoline
     void *tramp = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (tramp == MAP_FAILED) {
@@ -146,16 +146,16 @@ static bool inline_hook_arm64(void* target, void* replacement, void** orig_out) 
     *(uint64_t*)(tp + 2) = (uint64_t)((uintptr_t)target + 16);
 
     mprotect(tramp, PAGE, PROT_READ | PROT_EXEC);
-    __builtin___clear_cache((char*)tramp, (char*)tramp + 32);
+    sys_icache_invalidate(tramp, 32);
 
-    // 4. Ghi jump vào bản COPY (không phải page gốc)
+    // 3. Ghi jump vào bản copy
     uint32_t* pp = (uint32_t*)targetCopy;
     pp[0] = 0x58000050;
     pp[1] = 0xD61F0200;
     *(uint64_t*)(pp + 2) = (uint64_t)replacement;
-    __builtin___clear_cache((char*)targetCopy, (char*)targetCopy + 16);
+    sys_icache_invalidate(targetCopy, 16);
 
-    // 5. Remap page gốc trỏ sang bản copy
+    // 4. Remap page gốc trỏ sang bản copy
     vm_prot_t cur_prot = VM_PROT_NONE;
     vm_prot_t max_prot = VM_PROT_NONE;
     vm_address_t dest = (vm_address_t)pageAddr;
@@ -183,7 +183,7 @@ static bool inline_hook_arm64(void* target, void* replacement, void** orig_out) 
 }
 
 // ==========================================
-// DETECT SUBSTRATE (bao gồm bundle TrollFools)
+// DETECT SUBSTRATE
 // ==========================================
 static MSHookFunction_t g_msHook = NULL;
 static bool g_msInit = false;
@@ -192,14 +192,14 @@ static void detectSubstrate(void) {
     if (g_msInit) return;
     g_msInit = true;
 
-    // 1. dlsym toàn cục
+    // 1. Global
     g_msHook = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
     if (g_msHook) {
         SWLLog(@"✅ MSHookFunction có sẵn trong RTLD_DEFAULT");
         return;
     }
 
-    // 2. Bundle framework (TrollFools inject vào đây)
+    // 2. Bundle (TrollFools inject vào đây)
     const char* bundlePaths[] = {
         "@executable_path/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
         "@executable_path/Frameworks/libsubstrate.dylib",
@@ -219,7 +219,7 @@ static void detectSubstrate(void) {
         }
     }
 
-    // 3. Rootless / var/jb paths
+    // 3. JB paths
     const char* jbPaths[] = {
         "/var/jb/usr/lib/libsubstrate.dylib",
         "/var/jb/usr/lib/libsubstitute.dylib",
@@ -545,7 +545,7 @@ __attribute__((constructor)) static void swl_init() {
     g_logBuffer = [NSMutableArray array];
     g_logLock = [NSLock new];
 
-    SWLLog(@"dylib loaded — ver 4.0 (TrollStore ready)");
+    SWLLog(@"dylib loaded — ver 4.1 (TrollStore ready)");
 
     uintptr_t slide = getMainSlide();
     SWLLog(@"main slide = 0x%lx", slide);
@@ -566,7 +566,6 @@ __attribute__((constructor)) static void swl_init() {
             SWLLog(@"❌ set_Gold hook FAILED");
         }
 
-        // set_Population (bonus)
         void* addr_setPop = (void*)(slide + RVA_Team_set_Population);
         bool ok2 = doHook(addr_setPop,
                           (void*)&new_set_Population,
@@ -577,7 +576,6 @@ __attribute__((constructor)) static void swl_init() {
         SWLLog(@"❌ Không tìm được slide");
     }
 
-    // UI
     [[NSNotificationCenter defaultCenter]
         addObserverForName:UIApplicationDidBecomeActiveNotification
                     object:nil
