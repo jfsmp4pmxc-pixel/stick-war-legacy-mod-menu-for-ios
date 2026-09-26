@@ -47,27 +47,29 @@ static NSMutableArray<NSString*> *g_logBuffer = nil;
 static NSLock *g_logLock = nil;
 
 // ==========================================
-// LOG
+// LOG (an toàn trong mọi thread)
 // ==========================================
 static void SWLLog(NSString *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
-    va_end(args);
+    @autoreleasepool {
+        va_list args;
+        va_start(args, fmt);
+        NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+        va_end(args);
 
-    NSLog(@"[SWL] %@", msg);
+        NSLog(@"[SWL] %@", msg);
 
-    if (!g_logBuffer) {
-        g_logBuffer = [NSMutableArray array];
-        g_logLock = [NSLock new];
+        if (!g_logBuffer) {
+            g_logBuffer = [NSMutableArray array];
+            g_logLock = [NSLock new];
+        }
+        [g_logLock lock];
+        NSDateFormatter *df = [NSDateFormatter new];
+        df.dateFormat = @"HH:mm:ss";
+        NSString *ts = [df stringFromDate:[NSDate date]];
+        [g_logBuffer addObject:[NSString stringWithFormat:@"[%@] %@", ts, msg]];
+        if (g_logBuffer.count > 300) [g_logBuffer removeObjectAtIndex:0];
+        [g_logLock unlock];
     }
-    [g_logLock lock];
-    NSDateFormatter *df = [NSDateFormatter new];
-    df.dateFormat = @"HH:mm:ss";
-    NSString *ts = [df stringFromDate:[NSDate date]];
-    [g_logBuffer addObject:[NSString stringWithFormat:@"[%@] %@", ts, msg]];
-    if (g_logBuffer.count > 300) [g_logBuffer removeObjectAtIndex:0];
-    [g_logLock unlock];
 }
 
 // ==========================================
@@ -81,8 +83,21 @@ void (*old_set_Population)(void* this_, int value, void* method) = NULL;
 // ==========================================
 __attribute__((noinline))
 void new_set_Gold(void* this_, int value, void* method) {
+    // Guard cực kỳ quan trọng: this_ có thể NULL hoặc invalid
+    if (this_ == NULL || (uintptr_t)this_ < 0x100000000ULL) {
+        if (old_set_Gold) old_set_Gold(this_, value, method);
+        return;
+    }
+
     g_setGoldCalls++;
-    int dir = this_ ? *(int*)((uintptr_t)this_ + OFF_Team_direction) : -999;
+
+    int dir = -999;
+    @try {
+        dir = *(int*)((uintptr_t)this_ + OFF_Team_direction);
+    } @catch (NSException *e) {
+        dir = -998;
+    }
+
     g_lastDir = dir;
     g_lastValue = value;
 
@@ -91,7 +106,7 @@ void new_set_Gold(void* this_, int value, void* method) {
                g_setGoldCalls, this_, dir, value);
     }
 
-    if (this_ != NULL && old_set_Gold != NULL) {
+    if (old_set_Gold != NULL) {
         if (dir == 1) {
             if (mod_ZeroGoldPlayer) { old_set_Gold(this_, 9, method); return; }
             if (mod_InfGoldPlayer)  { old_set_Gold(this_, 999999, method); return; }
@@ -99,8 +114,8 @@ void new_set_Gold(void* this_, int value, void* method) {
             if (mod_ZeroGoldEnemy)  { old_set_Gold(this_, 9, method); return; }
             if (mod_InfGoldEnemy)   { old_set_Gold(this_, 999999, method); return; }
         }
+        old_set_Gold(this_, value, method);
     }
-    if (old_set_Gold) old_set_Gold(this_, value, method);
 }
 
 __attribute__((noinline))
@@ -109,13 +124,12 @@ void new_set_Population(void* this_, int value, void* method) {
 }
 
 // ==========================================
-// INLINE HOOK ARM64 QUA VM_REMAP
+// INLINE HOOK ARM64 (chỉ dùng nếu KHÔNG có substrate)
 // ==========================================
 static bool inline_hook_arm64(void* target, void* replacement, void** orig_out) {
     const size_t PAGE = 4096;
     uintptr_t pageAddr = (uintptr_t)target & ~(uintptr_t)(PAGE - 1);
 
-    // 1. Page mới chứa bản copy của page gốc
     void *newPage = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (newPage == MAP_FAILED) {
@@ -127,7 +141,6 @@ static bool inline_hook_arm64(void* target, void* replacement, void** orig_out) 
     uintptr_t targetOffset = (uintptr_t)target - pageAddr;
     void *targetCopy = (void*)((uintptr_t)newPage + targetOffset);
 
-    // 2. Trampoline
     void *tramp = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (tramp == MAP_FAILED) {
@@ -141,21 +154,19 @@ static bool inline_hook_arm64(void* target, void* replacement, void** orig_out) 
     memcpy(tramp, saved, 16);
 
     uint32_t* tp = (uint32_t*)((uintptr_t)tramp + 16);
-    tp[0] = 0x58000050;  // LDR X16, #8
-    tp[1] = 0xD61F0200;  // BR  X16
+    tp[0] = 0x58000050;
+    tp[1] = 0xD61F0200;
     *(uint64_t*)(tp + 2) = (uint64_t)((uintptr_t)target + 16);
 
     mprotect(tramp, PAGE, PROT_READ | PROT_EXEC);
     sys_icache_invalidate(tramp, 32);
 
-    // 3. Ghi jump vào bản copy
     uint32_t* pp = (uint32_t*)targetCopy;
     pp[0] = 0x58000050;
     pp[1] = 0xD61F0200;
     *(uint64_t*)(pp + 2) = (uint64_t)replacement;
     sys_icache_invalidate(targetCopy, 16);
 
-    // 4. Remap page gốc trỏ sang bản copy
     vm_prot_t cur_prot = VM_PROT_NONE;
     vm_prot_t max_prot = VM_PROT_NONE;
     vm_address_t dest = (vm_address_t)pageAddr;
@@ -188,18 +199,18 @@ static bool inline_hook_arm64(void* target, void* replacement, void** orig_out) 
 static MSHookFunction_t g_msHook = NULL;
 static bool g_msInit = false;
 
-static void detectSubstrate(void) {
-    if (g_msInit) return;
-    g_msInit = true;
+static bool detectSubstrate(void) {
+    if (g_msInit) return (g_msHook != NULL);
 
     // 1. Global
     g_msHook = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
     if (g_msHook) {
-        SWLLog(@"✅ MSHookFunction có sẵn trong RTLD_DEFAULT");
-        return;
+        g_msInit = true;
+        SWLLog(@"✅ MSHookFunction có sẵn");
+        return true;
     }
 
-    // 2. Bundle (TrollFools inject vào đây)
+    // 2. Bundle
     const char* bundlePaths[] = {
         "@executable_path/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
         "@executable_path/Frameworks/libsubstrate.dylib",
@@ -214,8 +225,9 @@ static void detectSubstrate(void) {
         MSHookFunction_t m = (MSHookFunction_t)dlsym(h, "MSHookFunction");
         if (m) {
             g_msHook = m;
-            SWLLog(@"✅ MSHookFunction từ bundle: %s", bundlePaths[i]);
-            return;
+            g_msInit = true;
+            SWLLog(@"✅ MSHookFunction từ: %s", bundlePaths[i]);
+            return true;
         }
     }
 
@@ -235,8 +247,9 @@ static void detectSubstrate(void) {
         MSHookFunction_t m = (MSHookFunction_t)dlsym(h, "MSHookFunction");
         if (m) {
             g_msHook = m;
+            g_msInit = true;
             SWLLog(@"✅ MSHookFunction từ: %s", jbPaths[i]);
-            return;
+            return true;
         }
     }
 
@@ -253,23 +266,22 @@ static void detectSubstrate(void) {
         MSHookFunction_t m = (MSHookFunction_t)dlsym(h, "MSHookFunction");
         if (m) {
             g_msHook = m;
+            g_msInit = true;
             SWLLog(@"✅ MSHookFunction theo tên: %s", names[i]);
-            return;
+            return true;
         }
     }
 
-    SWLLog(@"⚠️ Không có substrate → dùng inline hook");
+    // Chưa tìm được — chưa đánh dấu init để lần sau thử lại
+    return false;
 }
 
 static bool doHook(void* addr, void* replacement, void** orig_out) {
-    detectSubstrate();
-
-    if (g_msHook) {
+    if (detectSubstrate() && g_msHook) {
         g_msHook(addr, replacement, orig_out);
         g_hookMethod = true;
         return (*orig_out != NULL);
     }
-
     bool ok = inline_hook_arm64(addr, replacement, orig_out);
     g_hookMethod = false;
     return ok;
@@ -283,7 +295,7 @@ static uintptr_t findImageSlide(const char* keyword) {
         const char* name = _dyld_get_image_name(i);
         if (name && strstr(name, keyword)) {
             uintptr_t slide = _dyld_get_image_vmaddr_slide(i);
-            SWLLog(@"Image #%u: %s  slide=0x%lx", i, name, slide);
+            SWLLog(@"Image #%u: %s slide=0x%lx", i, name, slide);
             return slide;
         }
     }
@@ -539,48 +551,103 @@ static UIViewController *SWLTopViewController(void) {
 @end
 
 // ==========================================
-// CONSTRUCTOR
+// HOOK SETUP (chạy SAU khi app active)
 // ==========================================
-__attribute__((constructor)) static void swl_init() {
-    g_logBuffer = [NSMutableArray array];
-    g_logLock = [NSLock new];
-
-    SWLLog(@"dylib loaded — ver 4.1 (TrollStore ready)");
+static void performHooks(void) {
+    SWLLog(@"--- performHooks ---");
 
     uintptr_t slide = getMainSlide();
     SWLLog(@"main slide = 0x%lx", slide);
 
-    if (slide != 0) {
-        void* addr_setGold = (void*)(slide + RVA_Team_set_Gold);
-        SWLLog(@"set_Gold @ %p (RVA 0x%X)", addr_setGold, RVA_Team_set_Gold);
+    if (slide == 0) {
+        SWLLog(@"❌ Không tìm được slide");
+        return;
+    }
 
-        bool ok = doHook(addr_setGold,
-                         (void*)&new_set_Gold,
-                         (void**)&old_set_Gold);
+    void* addr_setGold = (void*)(slide + RVA_Team_set_Gold);
+    SWLLog(@"set_Gold @ %p (RVA 0x%X)", addr_setGold, RVA_Team_set_Gold);
 
-        if (ok) {
-            SWLLog(@"✅ set_Gold hooked (%s)",
-                   g_hookMethod ? "MSHook" : "inline");
-            g_hookOK = true;
-        } else {
-            SWLLog(@"❌ set_Gold hook FAILED");
-        }
+    bool ok = false;
+    @try {
+        ok = doHook(addr_setGold,
+                    (void*)&new_set_Gold,
+                    (void**)&old_set_Gold);
+    } @catch (NSException *e) {
+        SWLLog(@"❌ Exception khi hook set_Gold: %@", e);
+    }
 
-        void* addr_setPop = (void*)(slide + RVA_Team_set_Population);
+    if (ok) {
+        SWLLog(@"✅ set_Gold hooked (%s)",
+               g_hookMethod ? "MSHook" : "inline");
+        g_hookOK = true;
+    } else {
+        SWLLog(@"❌ set_Gold hook FAILED");
+    }
+
+    // set_Population (optional, không crash nếu fail)
+    void* addr_setPop = (void*)(slide + RVA_Team_set_Population);
+    @try {
         bool ok2 = doHook(addr_setPop,
                           (void*)&new_set_Population,
                           (void**)&old_set_Population);
         if (ok2) SWLLog(@"✅ set_Population hooked");
         else     SWLLog(@"⚠️ set_Population hook fail");
-    } else {
-        SWLLog(@"❌ Không tìm được slide");
+    } @catch (NSException *e) {
+        SWLLog(@"⚠️ Exception set_Population: %@", e);
     }
 
-    [[NSNotificationCenter defaultCenter]
-        addObserverForName:UIApplicationDidBecomeActiveNotification
-                    object:nil
-                     queue:[NSOperationQueue mainQueue]
-                usingBlock:^(NSNotification *note){
-        [[SWLGestureHandler shared] startWatching];
-    }];
+    SWLLog(@"--- performHooks done ---");
+}
+
+// ==========================================
+// CONSTRUCTOR (chỉ log + đăng ký observer, KHÔNG hook)
+// ==========================================
+__attribute__((constructor)) static void swl_init() {
+    @autoreleasepool {
+        g_logBuffer = [NSMutableArray array];
+        g_logLock = [NSLock new];
+
+        SWLLog(@"dylib loaded — ver 5.0 (deferred hook)");
+
+        // Đợi app active rồi mới hook
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationDidBecomeActiveNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note){
+            SWLLog(@"App became active — scheduling hook");
+
+            // Đợi thêm 3s cho chắc chắn game đã load hết + substrate đã vào
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                           dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                // Thử hook — retry tối đa 10 lần nếu chưa có substrate
+                for (int attempt = 1; attempt <= 10; attempt++) {
+                    SWLLog(@"Hook attempt #%d", attempt);
+
+                    __block bool hadSubstrate = false;
+                    __block bool hookDone = false;
+
+                    dispatch_sync(dispatch_get_main_queue(), ^{
+                        hadSubstrate = detectSubstrate();
+                    });
+
+                    if (hadSubstrate) {
+                        SWLLog(@"Substrate sẵn sàng — thực hiện hook");
+                        performHooks();
+                        hookDone = true;
+                    } else {
+                        SWLLog(@"⚠️ Chưa có substrate, đợi 500ms rồi thử lại...");
+                    }
+
+                    if (hookDone) break;
+                    usleep(500000);
+                }
+
+                // Setup gesture
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [[SWLGestureHandler shared] startWatching];
+                });
+            });
+        }];
+    }
 }
