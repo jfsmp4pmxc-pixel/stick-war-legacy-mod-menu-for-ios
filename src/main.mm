@@ -69,7 +69,6 @@ static UIWindow *SWLActiveWindow(void) {
             if (ws.windows.count > 0) return ws.windows.firstObject;
         }
     }
-    // Fallback cũ cho iOS < 13
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     return [UIApplication sharedApplication].keyWindow;
@@ -94,7 +93,6 @@ static UIViewController *SWLTopViewController(void) {
 @implementation SWLMenuManager
 
 + (void)showMenu {
-    // Bắt buộc main thread
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ [self showMenu]; });
         return;
@@ -105,7 +103,6 @@ static UIViewController *SWLTopViewController(void) {
         NSLog(@"[SWL] showMenu: no top VC yet");
         return;
     }
-    // Đang có alert khác → bỏ qua, tránh crash "presentation in progress"
     if (top.presentedViewController) {
         NSLog(@"[SWL] showMenu: another VC is presented");
         return;
@@ -114,7 +111,7 @@ static UIViewController *SWLTopViewController(void) {
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"Stick War Mod Menu"
                          message:@"Chạm 3 ngón hoặc gõ 3 lần để mở lại"
-                  preferredStyle:UIAlertControllerStyleAlert]; // Alert thay vì ActionSheet → an toàn trên iPad
+                  preferredStyle:UIAlertControllerStyleAlert];
 
     // ---- Vàng phe ta ----
     NSString *txtInfP = mod_InfGoldPlayer ? @"[ON] Vô hạn Vàng (Ta)" : @"[OFF] Vô hạn Vàng (Ta)";
@@ -187,17 +184,18 @@ static UIViewController *SWLTopViewController(void) {
                 NSLog(@"[SWL] Gestures attached to window: %@", win);
             }
         }];
-        // Giữ timer sống kể cả khi scroll (Unity view có thể chặn runloop default mode)
         [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
     });
 }
 
 - (void)attachGesturesToWindow:(UIWindow *)window {
-    // Tránh add trùng
+    // Tránh add trùng: chỉ check theo class UITapGestureRecognizer
     for (UIGestureRecognizer *g in window.gestureRecognizers) {
-        if ([g isKindOfClass:[UITapGestureRecognizer class]] &&
-            g.numberOfTouchesRequired == 3) {
-            return;
+        if (![g isKindOfClass:[UITapGestureRecognizer class]]) continue;
+        UITapGestureRecognizer *tap = (UITapGestureRecognizer *)g;
+        if (tap.numberOfTouchesRequired == 3 &&
+            tap.numberOfTapsRequired == 1) {
+            return; // đã có rồi
         }
     }
 
@@ -205,7 +203,7 @@ static UIViewController *SWLTopViewController(void) {
         initWithTarget:self action:@selector(handleMenuGesture)];
     threeFinger.numberOfTouchesRequired = 3;
     threeFinger.numberOfTapsRequired = 1;
-    threeFinger.cancelsTouchesInView = NO;   // Không chặn touch của game
+    threeFinger.cancelsTouchesInView = NO;
     threeFinger.delegate = self;
     [window addGestureRecognizer:threeFinger];
 
@@ -223,13 +221,11 @@ static UIViewController *SWLTopViewController(void) {
     [SWLMenuManager showMenu];
 }
 
-// Cho phép nhận đồng thời với gesture của Unity
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
     shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
     return YES;
 }
 
-// Cho phép nhận touch kể cả khi Unity view chặn
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
     shouldReceiveTouch:(UITouch *)touch {
     return YES;
