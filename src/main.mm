@@ -5,57 +5,49 @@
 #include <pthread.h>
 #include <unistd.h>
 
-// Định nghĩa cấu trúc Hook hệ thống
+// ==========================================
+// HOOK TYPES
+// ==========================================
 typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
 
 extern "C" {
-    // Biến trạng thái điều khiển tính năng game (Xuất ra ngoài cho Menu đọc)
-    bool mod_InfGoldPlayer = false;
-    bool mod_InfGoldEnemy = false;
-    bool mod_ZeroGoldPlayer = false;
-    bool mod_ZeroGoldEnemy = false;
+    bool mod_InfGoldPlayer     = false;
+    bool mod_InfGoldEnemy      = false;
+    bool mod_ZeroGoldPlayer    = false;
+    bool mod_ZeroGoldEnemy     = false;
 
-    int mod_SelectedUnitId = 2;   // 2 = SWORDWRATH, 5 = GIANT...
-    int mod_SpawnAmount = 1;      // Số lượng lính tùy chỉnh
-    int mod_SpawnTargetTeam = 0;  // 0: Phe mình, 1: Phe địch
-    bool mod_TriggerSpawnSignal = false; // Tín hiệu kích hoạt lệnh
+    int  mod_SelectedUnitId    = 2;
+    int  mod_SpawnAmount       = 1;
+    int  mod_SpawnTargetTeam   = 0;
+    bool mod_TriggerSpawnSignal = false;
 }
 
-// Con trỏ hàm gốc của game thu thập từ công đoạn phân tích file dump
-void* (*old_CreateUnit)(void* unitTypeClass);
-void* (*old_GetTeam)(int teamId); // Hàm giả định lấy thực thể Team từ trận đấu hiện tại
+void (*old_set_Gold)(void* instance, int value);
 
 // ==========================================
-// LOGIC HOOK GAME TRÊN IL2CPP
+// HOOK LOGIC
 // ==========================================
-void (*old_set_Gold)(void* instance, int value);
 void new_set_Gold(void* instance, int value) {
     if (instance != NULL) {
-        int direction = *(int*)((uintptr_t)instance + 0x58); // Offset 0x58: direction
-        
-        if (direction == 1) { // PHE TA
+        int direction = *(int*)((uintptr_t)instance + 0x58);
+        if (direction == 1) {
             if (mod_ZeroGoldPlayer) { old_set_Gold(instance, 9); return; }
-            if (mod_InfGoldPlayer) { old_set_Gold(instance, 999999); return; }
-        } 
-        else if (direction == -1) { // PHE ĐỊCH
-            if (mod_ZeroGoldEnemy) { old_set_Gold(instance, 9); return; }
-            if (mod_InfGoldEnemy) { old_set_Gold(instance, 999999); return; }
+            if (mod_InfGoldPlayer)  { old_set_Gold(instance, 999999); return; }
+        } else if (direction == -1) {
+            if (mod_ZeroGoldEnemy)  { old_set_Gold(instance, 9); return; }
+            if (mod_InfGoldEnemy)   { old_set_Gold(instance, 999999); return; }
         }
     }
     old_set_Gold(instance, value);
 }
 
-// Luồng xử lý lệnh triệu hồi lính (Chạy ngầm độc lập)
 void* SpawnMonitorThread(void* arg) {
     while (true) {
         if (mod_TriggerSpawnSignal) {
-            // Trong môi trường Unity il2cpp, việc gọi CreateUnit cần truyền đúng con trỏ System.Type của lính.
-            // Đoạn code này chạy vòng lặp theo số lượng bạn yêu cầu từ Mod Menu.
             for (int i = 0; i < mod_SpawnAmount; i++) {
-                // Logic ép sinh thực thể lính thông qua hàm Hook hoặc gọi trực tiếp offset
-                // old_CreateUnit(targetClassType); 
+                // TODO: gọi CreateUnit với class type tương ứng
             }
-            mod_TriggerSpawnSignal = false; // Tắt tín hiệu sau khi hoàn thành
+            mod_TriggerSpawnSignal = false;
         }
         usleep(100000);
     }
@@ -63,7 +55,37 @@ void* SpawnMonitorThread(void* arg) {
 }
 
 // ==========================================
-// QUẢN LÝ GIAO DIỆN MOD MENU HỆ THỐNG
+// HELPERS
+// ==========================================
+static UIWindow *SWLActiveWindow(void) {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if (![s isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *ws = (UIWindowScene *)s;
+            if (ws.activationState != UISceneActivationStateForegroundActive) continue;
+            for (UIWindow *w in ws.windows) {
+                if (w.isKeyWindow) return w;
+            }
+            if (ws.windows.count > 0) return ws.windows.firstObject;
+        }
+    }
+    // Fallback cũ cho iOS < 13
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return [UIApplication sharedApplication].keyWindow;
+#pragma clang diagnostic pop
+}
+
+static UIViewController *SWLTopViewController(void) {
+    UIWindow *win = SWLActiveWindow();
+    if (!win) return nil;
+    UIViewController *vc = win.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
+}
+
+// ==========================================
+// MENU MANAGER
 // ==========================================
 @interface SWLMenuManager : NSObject
 + (void)showMenu;
@@ -72,145 +94,186 @@ void* SpawnMonitorThread(void* arg) {
 @implementation SWLMenuManager
 
 + (void)showMenu {
-    // Tìm kiếm ViewController lớp cao nhất hiện tại một cách an toàn
-    UIViewController *topController = [UIApplication sharedApplication].keyWindow.rootViewController;
-    while (topController.presentedViewController) {
-        topController = topController.presentedViewController;
-    }
-    
-    // Nếu vẫn không tìm được qua keyWindow, quét toàn bộ các cửa sổ đang kết nối
-    if (!topController && @available(iOS 13.0, *)) {
-        for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if (scene.activationState == UISceneActivationStateForegroundActive) {
-                for (UIWindow *window in scene.windows) {
-                    if (window.rootViewController) {
-                        topController = window.rootViewController;
-                        while (topController.presentedViewController) {
-                            topController = topController.presentedViewController;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
+    // Bắt buộc main thread
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self showMenu]; });
+        return;
     }
 
-    if (!topController) return; // Phòng tránh crash nếu game chưa dựng xong UI
+    UIViewController *top = SWLTopViewController();
+    if (!top) {
+        NSLog(@"[SWL] showMenu: no top VC yet");
+        return;
+    }
+    // Đang có alert khác → bỏ qua, tránh crash "presentation in progress"
+    if (top.presentedViewController) {
+        NSLog(@"[SWL] showMenu: another VC is presented");
+        return;
+    }
 
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Stick War Mod Menu" 
-                                                                   message:@"Điều khiển tính năng (Gõ 3 ngón tay để mở lại):" 
-                                                            preferredStyle:UIAlertControllerStyleActionSheet];
-    
-    // --- KHU VỰC CÔNG TẮC VÀNG ---
-    NSString *txtGoldPlayer = mod_InfGoldPlayer ? @"[ON] Vô hạn Vàng (Phe Ta)" : @"[OFF] Vô hạn Vàng (Phe Ta)";
-    [alert addAction:[UIAlertAction actionWithTitle:txtGoldPlayer style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"Stick War Mod Menu"
+                         message:@"Chạm 3 ngón hoặc gõ 3 lần để mở lại"
+                  preferredStyle:UIAlertControllerStyleAlert]; // Alert thay vì ActionSheet → an toàn trên iPad
+
+    // ---- Vàng phe ta ----
+    NSString *txtInfP = mod_InfGoldPlayer ? @"[ON] Vô hạn Vàng (Ta)" : @"[OFF] Vô hạn Vàng (Ta)";
+    [alert addAction:[UIAlertAction actionWithTitle:txtInfP style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
         mod_InfGoldPlayer = !mod_InfGoldPlayer;
         if (mod_InfGoldPlayer) mod_ZeroGoldPlayer = false;
     }]];
-    
-    NSString *txtZeroPlayer = mod_ZeroGoldPlayer ? @"[ON] Luôn có 9 Vàng (Phe Ta)" : @"[OFF] Luôn có 9 Vàng (Phe Ta)";
-    [alert addAction:[UIAlertAction actionWithTitle:txtZeroPlayer style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+
+    NSString *txtZeroP = mod_ZeroGoldPlayer ? @"[ON] 9 Vàng (Ta)" : @"[OFF] 9 Vàng (Ta)";
+    [alert addAction:[UIAlertAction actionWithTitle:txtZeroP style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
         mod_ZeroGoldPlayer = !mod_ZeroGoldPlayer;
         if (mod_ZeroGoldPlayer) mod_InfGoldPlayer = false;
     }]];
 
-    NSString *txtGoldEnemy = mod_InfGoldEnemy ? @"[ON] Vô hạn Vàng (Phe Địch)" : @"[OFF] Vô hạn Vàng (Phe Địch)";
-    [alert addAction:[UIAlertAction actionWithTitle:txtGoldEnemy style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+    // ---- Vàng phe địch ----
+    NSString *txtInfE = mod_InfGoldEnemy ? @"[ON] Vô hạn Vàng (Địch)" : @"[OFF] Vô hạn Vàng (Địch)";
+    [alert addAction:[UIAlertAction actionWithTitle:txtInfE style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
         mod_InfGoldEnemy = !mod_InfGoldEnemy;
         if (mod_InfGoldEnemy) mod_ZeroGoldEnemy = false;
     }]];
 
-    NSString *txtZeroEnemy = mod_ZeroGoldEnemy ? @"[ON] Luôn có 9 Vàng (Phe Địch)" : @"[OFF] Luôn có 9 Vàng (Phe Địch)";
-    [alert addAction:[UIAlertAction actionWithTitle:txtZeroEnemy style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+    NSString *txtZeroE = mod_ZeroGoldEnemy ? @"[ON] 9 Vàng (Địch)" : @"[OFF] 9 Vàng (Địch)";
+    [alert addAction:[UIAlertAction actionWithTitle:txtZeroE style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
         mod_ZeroGoldEnemy = !mod_ZeroGoldEnemy;
         if (mod_ZeroGoldEnemy) mod_InfGoldEnemy = false;
     }]];
 
-    // --- KHU VỰC ĐIỀU CHỈNH SPAWN LÍNH (DANH SÁCH NHANH) ---
-    [alert addAction:[UIAlertAction actionWithTitle:@"Triệu hồi 5 GIANT (Phe Ta)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        mod_SelectedUnitId = 5;       // ID Giant
-        mod_SpawnAmount = 5;
-        mod_SpawnTargetTeam = 0;      // Phe mình
-        mod_TriggerSpawnSignal = true;
+    // ---- Spawn nhanh ----
+    [alert addAction:[UIAlertAction actionWithTitle:@"Spawn 5 GIANT (Ta)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        mod_SelectedUnitId = 5; mod_SpawnAmount = 5;
+        mod_SpawnTargetTeam = 0; mod_TriggerSpawnSignal = true;
     }]];
-    
-    [alert addAction:[UIAlertAction actionWithTitle:@"Triệu hồi 10 SWORDWRATH (Phe Địch)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        mod_SelectedUnitId = 2;       // ID Swordwrath
-        mod_SpawnAmount = 10;
-        mod_SpawnTargetTeam = 1;      // Phe địch
-        mod_TriggerSpawnSignal = true;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Spawn 10 SWORDWRATH (Địch)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        mod_SelectedUnitId = 2; mod_SpawnAmount = 10;
+        mod_SpawnTargetTeam = 1; mod_TriggerSpawnSignal = true;
     }]];
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"Đóng Menu" style:UIAlertActionStyleCancel handler:nil]];
-    
-    // Ép hiển thị Menu hệ thống lên trên cùng màn hình
-    [topController presentViewController:alert animated:YES completion:nil];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
+
+    [top presentViewController:alert animated:YES completion:nil];
 }
 
 @end
 
 // ==========================================
-// CƠ CHẾ KÍCH HOẠT MENU BẰNG CỬ CHỈ TRONG SUỐT
+// GESTURE HANDLER (singleton để giữ delegate sống)
 // ==========================================
-@interface SWLGestureHandler : NSObject
-+ (void)setupGesture;
+@interface SWLGestureHandler : NSObject <UIGestureRecognizerDelegate>
++ (instancetype)shared;
+- (void)startWatching;
 @end
 
 @implementation SWLGestureHandler
 
-+ (void)setupGesture {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIWindow *window = [UIApplication sharedApplication].keyWindow;
-        if (!window && @available(iOS 13.0, *)) {
-            for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-                if (scene.activationState == UISceneActivationStateForegroundActive) {
-                    window = scene.windows.firstObject;
-                    break;
-                }
++ (instancetype)shared {
+    static SWLGestureHandler *s;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [SWLGestureHandler new]; });
+    return s;
+}
+
+- (void)startWatching {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        __block NSTimer *timer = nil;
+        timer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t){
+            UIWindow *win = SWLActiveWindow();
+            if (win) {
+                [t invalidate];
+                [self attachGesturesToWindow:win];
+                NSLog(@"[SWL] Gestures attached to window: %@", win);
             }
-        }
-        
-        if (window) {
-            // Tạo cử chỉ chạm đồng thời 3 ngón tay lên màn hình để mở Menu
-            UITapGestureRecognizer *threeFingerTap = [[UITapGestureRecognizer alloc] initWithTarget:[SWLMenuManager class] action:@selector(showMenu)];
-            threeFingerTap.numberOfTouchesRequired = 3; // Yêu cầu chạm bằng 3 ngón tay cùng lúc
-            threeFingerTap.numberOfTapsRequired = 1;
-            
-            [window addGestureRecognizer:threeFingerTap];
-            
-            // Dự phòng thêm: Gõ liên tục 3 lần bằng 1 ngón tay vào màn hình phòng trường hợp đa điểm bị lỗi
-            UITapGestureRecognizer *tripleTap = [[UITapGestureRecognizer alloc] initWithTarget:[SWLMenuManager class] action:@selector(showMenu)];
-            tripleTap.numberOfTapsRequired = 3; // Gõ nhanh 3 phát liên tục
-            tripleTap.numberOfTouchesRequired = 1;
-            
-            [window addGestureRecognizer:tripleTap];
-        }
+        }];
+        // Giữ timer sống kể cả khi scroll (Unity view có thể chặn runloop default mode)
+        [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
     });
+}
+
+- (void)attachGesturesToWindow:(UIWindow *)window {
+    // Tránh add trùng
+    for (UIGestureRecognizer *g in window.gestureRecognizers) {
+        if ([g isKindOfClass:[UITapGestureRecognizer class]] &&
+            g.numberOfTouchesRequired == 3) {
+            return;
+        }
+    }
+
+    UITapGestureRecognizer *threeFinger = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(handleMenuGesture)];
+    threeFinger.numberOfTouchesRequired = 3;
+    threeFinger.numberOfTapsRequired = 1;
+    threeFinger.cancelsTouchesInView = NO;   // Không chặn touch của game
+    threeFinger.delegate = self;
+    [window addGestureRecognizer:threeFinger];
+
+    UITapGestureRecognizer *tripleTap = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(handleMenuGesture)];
+    tripleTap.numberOfTouchesRequired = 1;
+    tripleTap.numberOfTapsRequired = 3;
+    tripleTap.cancelsTouchesInView = NO;
+    tripleTap.delegate = self;
+    [window addGestureRecognizer:tripleTap];
+}
+
+- (void)handleMenuGesture {
+    NSLog(@"[SWL] Menu gesture fired");
+    [SWLMenuManager showMenu];
+}
+
+// Cho phép nhận đồng thời với gesture của Unity
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
+    shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
+    return YES;
+}
+
+// Cho phép nhận touch kể cả khi Unity view chặn
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
+    shouldReceiveTouch:(UITouch *)touch {
+    return YES;
 }
 
 @end
 
 // ==========================================
-// HÀM KHỞI TẠO CHÍNH (CONSTRUCTOR)
+// CONSTRUCTOR
 // ==========================================
-__attribute__((constructor)) static void init() {
-    uintptr_t target_slide = _dyld_get_image_vmaddr_slide(0);
-    
+__attribute__((constructor)) static void swl_init() {
+    NSLog(@"[SWL] dylib loaded");
+
+    // --- Hook ---
     void *substrate = dlopen("@executable_path/libsubstrate.dylib", RTLD_LAZY);
     if (!substrate) substrate = dlopen("/usr/lib/libsubstrate.dylib", RTLD_LAZY);
-    
+    if (!substrate) substrate = dlopen("/usr/lib/libsubstitute.dylib", RTLD_LAZY);
+
     if (substrate) {
-        MSHookFunction_t MSHookFunction = (MSHookFunction_t)dlsym(substrate, "MSHookFunction");
+        MSHookFunction_t MSHookFunction =
+            (MSHookFunction_t)dlsym(substrate, "MSHookFunction");
         if (MSHookFunction) {
-            // Hook hàm chỉnh Vàng (Offset Hex: 0x39747060)
-            MSHookFunction((void*)(target_slide + 0x39747060), (void*)&new_set_Gold, (void**)&old_set_Gold);
+            uintptr_t slide = _dyld_get_image_vmaddr_slide(0);
+            MSHookFunction((void*)(slide + 0x39747060),
+                           (void*)&new_set_Gold,
+                           (void**)&old_set_Gold);
+            NSLog(@"[SWL] Hook installed at %p", (void*)(slide + 0x39747060));
+        } else {
+            NSLog(@"[SWL] MSHookFunction not found");
         }
+    } else {
+        NSLog(@"[SWL] substrate/substitute not found");
     }
-    
-    // Chạy ngầm luồng giám sát tín hiệu triệu hồi lính
-    pthread_t spawnThread;
-    pthread_create(&spawnThread, NULL, SpawnMonitorThread, NULL);
-    
-    // Kích hoạt hệ thống lắng nghe cử chỉ mở Menu độc lập chống đè đồ họa
-    [SWLGestureHandler setupGesture];
+
+    // --- Spawn thread ---
+    pthread_t th;
+    pthread_create(&th, NULL, SpawnMonitorThread, NULL);
+
+    // --- UI: chờ app active rồi mới gắn gesture ---
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIApplicationDidBecomeActiveNotification
+                    object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *note){
+        [[SWLGestureHandler shared] startWatching];
+    }];
 }
