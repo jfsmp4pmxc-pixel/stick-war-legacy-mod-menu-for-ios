@@ -1,10 +1,14 @@
 #include <UIKit/UIKit.h>
 #include <Foundation/Foundation.h>
 #include <mach-o/dyld.h>
+#include <mach/vm_map.h>
+#include <mach/mach.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/mman.h>
 
 // ==========================================
 // HOOK TYPES
@@ -28,20 +32,21 @@ extern "C" {
 #define OFF_Team_direction       0x58
 
 // ==========================================
-// GLOBAL DEBUG STATE
+// GLOBAL STATE
 // ==========================================
 static int  g_setGoldCalls = 0;
 static int  g_getGoldCalls = 0;
 static int  g_lastDir = 0;
 static int  g_lastValue = 0;
 static int  g_lastGetValue = 0;
-static char g_lastName[64] = "";
+static bool g_hookMethod = false;   // true = MSHook, false = inline
+static bool g_hookOK = false;
 
 static NSMutableArray<NSString*> *g_logBuffer = nil;
 static NSLock *g_logLock = nil;
 
 // ==========================================
-// LOG SYSTEM
+// LOG
 // ==========================================
 static void SWLLog(NSString *fmt, ...) {
     va_list args;
@@ -60,33 +65,32 @@ static void SWLLog(NSString *fmt, ...) {
     df.dateFormat = @"HH:mm:ss";
     NSString *ts = [df stringFromDate:[NSDate date]];
     [g_logBuffer addObject:[NSString stringWithFormat:@"[%@] %@", ts, msg]];
-    if (g_logBuffer.count > 200) [g_logBuffer removeObjectAtIndex:0];
+    if (g_logBuffer.count > 300) [g_logBuffer removeObjectAtIndex:0];
     [g_logLock unlock];
 }
 
 // ==========================================
-// ORIGINAL FUNCTIONS
+// ORIGINALS
 // ==========================================
-void (*old_set_Gold)(void* this_, int value, void* method);
-void (*old_set_Population)(void* this_, int value, void* method);
-int  (*old_get_Gold)(void* this_, void* method);
+void (*old_set_Gold)(void* this_, int value, void* method) = NULL;
+void (*old_set_Population)(void* this_, int value, void* method) = NULL;
 
 // ==========================================
 // HOOK IMPLEMENTATIONS
 // ==========================================
+__attribute__((noinline))
 void new_set_Gold(void* this_, int value, void* method) {
     g_setGoldCalls++;
     int dir = this_ ? *(int*)((uintptr_t)this_ + OFF_Team_direction) : -999;
     g_lastDir = dir;
     g_lastValue = value;
-    snprintf(g_lastName, sizeof(g_lastName), "set_Gold dir=%d val=%d", dir, value);
 
     if (g_setGoldCalls <= 20) {
-        SWLLog(@"set_Gold #%d this=%p dir=%d value=%d",
+        SWLLog(@"set_Gold #%d this=%p dir=%d val=%d",
                g_setGoldCalls, this_, dir, value);
     }
 
-    if (this_ != NULL) {
+    if (this_ != NULL && old_set_Gold != NULL) {
         if (dir == 1) {
             if (mod_ZeroGoldPlayer) { old_set_Gold(this_, 9, method); return; }
             if (mod_InfGoldPlayer)  { old_set_Gold(this_, 999999, method); return; }
@@ -95,29 +99,180 @@ void new_set_Gold(void* this_, int value, void* method) {
             if (mod_InfGoldEnemy)   { old_set_Gold(this_, 999999, method); return; }
         }
     }
-    old_set_Gold(this_, value, method);
+    if (old_set_Gold) old_set_Gold(this_, value, method);
 }
 
-int new_get_Gold(void* this_, void* method) {
-    g_getGoldCalls++;
-    int ret = old_get_Gold(this_, method);
-    int dir = this_ ? *(int*)((uintptr_t)this_ + OFF_Team_direction) : -999;
-    g_lastGetValue = ret;
-
-    if (g_getGoldCalls <= 20) {
-        SWLLog(@"get_Gold #%d this=%p dir=%d ret=%d",
-               g_getGoldCalls, this_, dir, ret);
-    }
-
-    if (this_ != NULL) {
-        if (dir == 1 && mod_InfGoldPlayer) return 999999;
-        if (dir == -1 && mod_InfGoldEnemy) return 999999;
-    }
-    return ret;
-}
-
+__attribute__((noinline))
 void new_set_Population(void* this_, int value, void* method) {
-    old_set_Population(this_, value, method);
+    if (old_set_Population) old_set_Population(this_, value, method);
+}
+
+// ==========================================
+// INLINE HOOK ARM64 QUA VM_REMAP (cho TrollStore)
+// ==========================================
+static bool inline_hook_arm64(void* target, void* replacement, void** orig_out) {
+    const size_t PAGE = 4096;
+    uintptr_t pageAddr = (uintptr_t)target & ~(uintptr_t)(PAGE - 1);
+
+    // 1. Tạo page mới RWX chứa bản copy của page gốc
+    void *newPage = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (newPage == MAP_FAILED) {
+        SWLLog(@"❌ mmap newPage fail: %s", strerror(errno));
+        return false;
+    }
+    memcpy(newPage, (void*)pageAddr, PAGE);
+
+    // 2. Tính offset target trong page
+    uintptr_t targetOffset = (uintptr_t)target - pageAddr;
+    void *targetCopy = (void*)((uintptr_t)newPage + targetOffset);
+
+    // 3. Tạo trampoline: 16 byte đầu hàm gốc + jump về target+16
+    void *tramp = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tramp == MAP_FAILED) {
+        SWLLog(@"❌ mmap tramp fail: %s", strerror(errno));
+        munmap(newPage, PAGE);
+        return false;
+    }
+
+    uint8_t saved[16];
+    memcpy(saved, target, 16);
+    memcpy(tramp, saved, 16);
+
+    uint32_t* tp = (uint32_t*)((uintptr_t)tramp + 16);
+    tp[0] = 0x58000050;  // LDR X16, #8
+    tp[1] = 0xD61F0200;  // BR  X16
+    *(uint64_t*)(tp + 2) = (uint64_t)((uintptr_t)target + 16);
+
+    mprotect(tramp, PAGE, PROT_READ | PROT_EXEC);
+    __builtin___clear_cache((char*)tramp, (char*)tramp + 32);
+
+    // 4. Ghi jump vào bản COPY (không phải page gốc)
+    uint32_t* pp = (uint32_t*)targetCopy;
+    pp[0] = 0x58000050;
+    pp[1] = 0xD61F0200;
+    *(uint64_t*)(pp + 2) = (uint64_t)replacement;
+    __builtin___clear_cache((char*)targetCopy, (char*)targetCopy + 16);
+
+    // 5. Remap page gốc trỏ sang bản copy
+    vm_prot_t cur_prot = VM_PROT_NONE;
+    vm_prot_t max_prot = VM_PROT_NONE;
+    vm_address_t dest = (vm_address_t)pageAddr;
+
+    kern_return_t kr = vm_remap(mach_task_self(),
+                                 &dest,
+                                 PAGE,
+                                 0,
+                                 VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                                 mach_task_self(),
+                                 (vm_address_t)newPage,
+                                 FALSE,
+                                 &cur_prot, &max_prot,
+                                 VM_INHERIT_NONE);
+    if (kr != KERN_SUCCESS) {
+        SWLLog(@"❌ vm_remap fail: %d", kr);
+        munmap(newPage, PAGE);
+        munmap(tramp, PAGE);
+        return false;
+    }
+
+    SWLLog(@"✅ Inline hook OK qua vm_remap");
+    *orig_out = tramp;
+    return true;
+}
+
+// ==========================================
+// DETECT SUBSTRATE (bao gồm bundle TrollFools)
+// ==========================================
+static MSHookFunction_t g_msHook = NULL;
+static bool g_msInit = false;
+
+static void detectSubstrate(void) {
+    if (g_msInit) return;
+    g_msInit = true;
+
+    // 1. dlsym toàn cục
+    g_msHook = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
+    if (g_msHook) {
+        SWLLog(@"✅ MSHookFunction có sẵn trong RTLD_DEFAULT");
+        return;
+    }
+
+    // 2. Bundle framework (TrollFools inject vào đây)
+    const char* bundlePaths[] = {
+        "@executable_path/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
+        "@executable_path/Frameworks/libsubstrate.dylib",
+        "@executable_path/Frameworks/libsubstitute.dylib",
+        "@executable_path/Frameworks/libellekit.dylib",
+        "@executable_path/libsubstrate.dylib",
+        "@executable_path/libsubstitute.dylib",
+    };
+    for (size_t i = 0; i < sizeof(bundlePaths)/sizeof(bundlePaths[0]); i++) {
+        void* h = dlopen(bundlePaths[i], RTLD_NOW | RTLD_GLOBAL);
+        if (!h) continue;
+        MSHookFunction_t m = (MSHookFunction_t)dlsym(h, "MSHookFunction");
+        if (m) {
+            g_msHook = m;
+            SWLLog(@"✅ MSHookFunction từ bundle: %s", bundlePaths[i]);
+            return;
+        }
+    }
+
+    // 3. Rootless / var/jb paths
+    const char* jbPaths[] = {
+        "/var/jb/usr/lib/libsubstrate.dylib",
+        "/var/jb/usr/lib/libsubstitute.dylib",
+        "/var/jb/usr/lib/libellekit.dylib",
+        "/var/jb/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
+        "/usr/lib/libsubstrate.dylib",
+        "/usr/lib/libsubstitute.dylib",
+        "/usr/lib/libellekit.dylib",
+    };
+    for (size_t i = 0; i < sizeof(jbPaths)/sizeof(jbPaths[0]); i++) {
+        void* h = dlopen(jbPaths[i], RTLD_NOW | RTLD_GLOBAL);
+        if (!h) continue;
+        MSHookFunction_t m = (MSHookFunction_t)dlsym(h, "MSHookFunction");
+        if (m) {
+            g_msHook = m;
+            SWLLog(@"✅ MSHookFunction từ: %s", jbPaths[i]);
+            return;
+        }
+    }
+
+    // 4. Leaf names
+    const char* names[] = {
+        "libsubstrate.dylib",
+        "libsubstitute.dylib",
+        "libellekit.dylib",
+        "CydiaSubstrate",
+    };
+    for (size_t i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
+        void* h = dlopen(names[i], RTLD_NOW | RTLD_GLOBAL);
+        if (!h) continue;
+        MSHookFunction_t m = (MSHookFunction_t)dlsym(h, "MSHookFunction");
+        if (m) {
+            g_msHook = m;
+            SWLLog(@"✅ MSHookFunction theo tên: %s", names[i]);
+            return;
+        }
+    }
+
+    SWLLog(@"⚠️ Không có substrate → dùng inline hook");
+}
+
+static bool doHook(void* addr, void* replacement, void** orig_out) {
+    detectSubstrate();
+
+    if (g_msHook) {
+        g_msHook(addr, replacement, orig_out);
+        g_hookMethod = true;
+        return (*orig_out != NULL);
+    }
+
+    bool ok = inline_hook_arm64(addr, replacement, orig_out);
+    g_hookMethod = false;
+    return ok;
 }
 
 // ==========================================
@@ -137,7 +292,7 @@ static uintptr_t findImageSlide(const char* keyword) {
 
 static uintptr_t getMainSlide() {
     NSString* proc = [[NSProcessInfo processInfo] processName];
-    SWLLog(@"Process name: %@", proc);
+    SWLLog(@"Process: %@", proc);
     uintptr_t slide = findImageSlide([proc UTF8String]);
     if (slide) return slide;
     slide = findImageSlide("StickWar");
@@ -186,7 +341,7 @@ static UIViewController *SWLTopViewController(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.9];
+    self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.95];
 
     CGRect b = self.view.bounds;
 
@@ -197,43 +352,36 @@ static UIViewController *SWLTopViewController(void) {
     title.textAlignment = NSTextAlignmentCenter;
     [self.view addSubview:title];
 
-    // Thống kê
-    UILabel *stats = [[UILabel alloc] initWithFrame:CGRectMake(10, 85, b.size.width - 20, 80)];
+    UILabel *stats = [[UILabel alloc] initWithFrame:CGRectMake(10, 85, b.size.width - 20, 90)];
     stats.numberOfLines = 0;
     stats.textColor = [UIColor yellowColor];
-    stats.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+    stats.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
     stats.text = [NSString stringWithFormat:
-        @"set_Gold calls: %d\n"
-        @"get_Gold calls: %d\n"
-        @"last set: dir=%d val=%d\n"
-        @"last get value: %d",
-        g_setGoldCalls, g_getGoldCalls,
-        g_lastDir, g_lastValue, g_lastGetValue];
+        @"Hook method: %@\n"
+        @"Hook OK: %@\n"
+        @"set_Gold calls: %d (dir=%d val=%d)\n"
+        @"get_Gold calls: %d (ret=%d)",
+        g_hookMethod ? @"MSHookFunction" : @"Inline arm64",
+        g_hookOK ? @"YES ✅" : @"NO ❌",
+        g_setGoldCalls, g_lastDir, g_lastValue,
+        g_getGoldCalls, g_lastGetValue];
     [self.view addSubview:stats];
 
-    // Log list
-    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(10, 175, b.size.width - 20, b.size.height - 250)];
+    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(10, 185, b.size.width - 20, b.size.height - 260)];
     tv.backgroundColor = [UIColor colorWithWhite:0.1 alpha:1];
     tv.textColor = [UIColor greenColor];
-    tv.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    tv.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
     tv.editable = NO;
 
     NSMutableString *all = [NSMutableString string];
     [g_logLock lock];
-    for (NSString *line in g_logBuffer) {
-        [all appendFormat:@"%@\n", line];
-    }
+    for (NSString *line in g_logBuffer) [all appendFormat:@"%@\n", line];
     [g_logLock unlock];
     if (all.length == 0) [all appendString:@"(chưa có log)"];
     tv.text = all;
-
-    // Auto-scroll to bottom
-    NSRange r = NSMakeRange(tv.text.length - 1, 1);
-    [tv scrollRangeToVisible:r];
-
+    if (tv.text.length > 1) [tv scrollRangeToVisible:NSMakeRange(tv.text.length - 1, 1)];
     [self.view addSubview:tv];
 
-    // Close button
     UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
     close.frame = CGRectMake(20, b.size.height - 60, b.size.width - 40, 44);
     [close setTitle:@"Đóng" forState:UIControlStateNormal];
@@ -266,29 +414,22 @@ static UIViewController *SWLTopViewController(void) {
     }
 
     UIViewController *top = SWLTopViewController();
-    if (!top) {
-        SWLLog(@"showMenu: no top VC");
-        return;
-    }
-    if (top.presentedViewController) {
-        SWLLog(@"showMenu: another VC presented");
-        return;
-    }
+    if (!top) { SWLLog(@"showMenu: no top VC"); return; }
+    if (top.presentedViewController) { SWLLog(@"showMenu: VC busy"); return; }
 
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"Stick War Mod Menu"
-                         message:[NSString stringWithFormat:@"Hooks: %d set / %d get",
-                                  g_setGoldCalls, g_getGoldCalls]
+                         message:[NSString stringWithFormat:@"Hook: %@ | set calls: %d",
+                                  g_hookMethod ? @"MSHook" : @"Inline",
+                                  g_setGoldCalls]
                   preferredStyle:UIAlertControllerStyleAlert];
 
-    // ===== XEM LOG =====
     [alert addAction:[UIAlertAction actionWithTitle:@"📋 Xem Log Debug" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
         SWLLogViewer *v = [SWLLogViewer new];
         v.modalPresentationStyle = UIModalPresentationOverFullScreen;
         [top presentViewController:v animated:YES completion:nil];
     }]];
 
-    // ===== VÀNG PHE TA =====
     NSString *txtInfP = mod_InfGoldPlayer ? @"[ON] Vô hạn Vàng (Ta)" : @"[OFF] Vô hạn Vàng (Ta)";
     [alert addAction:[UIAlertAction actionWithTitle:txtInfP style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
         mod_InfGoldPlayer = !mod_InfGoldPlayer;
@@ -303,7 +444,6 @@ static UIViewController *SWLTopViewController(void) {
         SWLLog(@"ZeroGoldPlayer = %d", mod_ZeroGoldPlayer);
     }]];
 
-    // ===== VÀNG PHE ĐỊCH =====
     NSString *txtInfE = mod_InfGoldEnemy ? @"[ON] Vô hạn Vàng (Địch)" : @"[OFF] Vô hạn Vàng (Địch)";
     [alert addAction:[UIAlertAction actionWithTitle:txtInfE style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
         mod_InfGoldEnemy = !mod_InfGoldEnemy;
@@ -402,51 +542,42 @@ static UIViewController *SWLTopViewController(void) {
 // CONSTRUCTOR
 // ==========================================
 __attribute__((constructor)) static void swl_init() {
-    // Init log system trước
     g_logBuffer = [NSMutableArray array];
     g_logLock = [NSLock new];
 
-    SWLLog(@"dylib loaded — ver 2.0");
+    SWLLog(@"dylib loaded — ver 4.0 (TrollStore ready)");
 
-    // 1. Substrate
-    void* substrate = dlopen("@executable_path/libsubstrate.dylib", RTLD_LAZY);
-    if (!substrate) substrate = dlopen("/usr/lib/libsubstrate.dylib", RTLD_LAZY);
-    if (!substrate) substrate = dlopen("/usr/lib/libsubstitute.dylib", RTLD_LAZY);
+    uintptr_t slide = getMainSlide();
+    SWLLog(@"main slide = 0x%lx", slide);
 
-    if (!substrate) {
-        SWLLog(@"❌ Không có substrate/substitute");
-    } else {
-        SWLLog(@"✅ substrate loaded");
-        MSHookFunction_t MSHookFunction =
-            (MSHookFunction_t)dlsym(substrate, "MSHookFunction");
+    if (slide != 0) {
+        void* addr_setGold = (void*)(slide + RVA_Team_set_Gold);
+        SWLLog(@"set_Gold @ %p (RVA 0x%X)", addr_setGold, RVA_Team_set_Gold);
 
-        if (!MSHookFunction) {
-            SWLLog(@"❌ Không có MSHookFunction");
+        bool ok = doHook(addr_setGold,
+                         (void*)&new_set_Gold,
+                         (void**)&old_set_Gold);
+
+        if (ok) {
+            SWLLog(@"✅ set_Gold hooked (%s)",
+                   g_hookMethod ? "MSHook" : "inline");
+            g_hookOK = true;
         } else {
-            SWLLog(@"✅ MSHookFunction available");
-            uintptr_t slide = getMainSlide();
-            SWLLog(@"main slide = 0x%lx", slide);
-
-            if (slide != 0) {
-                void* addr_setGold = (void*)(slide + RVA_Team_set_Gold);
-                SWLLog(@"set_Gold @ %p (RVA 0x%X)", addr_setGold, RVA_Team_set_Gold);
-                MSHookFunction(addr_setGold, (void*)&new_set_Gold, (void**)&old_set_Gold);
-
-                void* addr_getGold = (void*)(slide + RVA_Team_get_Gold);
-                SWLLog(@"get_Gold @ %p (RVA 0x%X)", addr_getGold, RVA_Team_get_Gold);
-                MSHookFunction(addr_getGold, (void*)&new_get_Gold, (void**)&old_get_Gold);
-
-                void* addr_setPop = (void*)(slide + RVA_Team_set_Population);
-                MSHookFunction(addr_setPop, (void*)&new_set_Population, (void**)&old_set_Population);
-
-                SWLLog(@"✅ Hooks installed");
-            } else {
-                SWLLog(@"❌ Không tìm được slide");
-            }
+            SWLLog(@"❌ set_Gold hook FAILED");
         }
+
+        // set_Population (bonus)
+        void* addr_setPop = (void*)(slide + RVA_Team_set_Population);
+        bool ok2 = doHook(addr_setPop,
+                          (void*)&new_set_Population,
+                          (void**)&old_set_Population);
+        if (ok2) SWLLog(@"✅ set_Population hooked");
+        else     SWLLog(@"⚠️ set_Population hook fail");
+    } else {
+        SWLLog(@"❌ Không tìm được slide");
     }
 
-    // 2. UI
+    // UI
     [[NSNotificationCenter defaultCenter]
         addObserverForName:UIApplicationDidBecomeActiveNotification
                     object:nil
