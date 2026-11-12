@@ -49,7 +49,7 @@ Build tay trên macOS có Xcode:
 ```bash
 clang++ -dynamiclib -std=c++17 -fobjc-arc -fvisibility=hidden -arch arm64 \
   -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" -miphoneos-version-min=15.0 \
-  -framework Foundation -framework UIKit src/*.cpp src/*.mm -o StickWarMod.dylib
+  -framework Foundation -framework UIKit -framework CoreGraphics src/*.cpp src/*.mm -o StickWarMod.dylib
 codesign -f -s - StickWarMod.dylib
 ```
 

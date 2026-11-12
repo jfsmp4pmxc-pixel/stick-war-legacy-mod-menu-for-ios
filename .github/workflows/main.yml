@@ -22,6 +22,7 @@ jobs:
           -miphoneos-version-min=15.0 \
           -framework Foundation \
           -framework UIKit \
+          -framework CoreGraphics \
           src/*.cpp src/*.mm \
           -o build/StickWarMod.dylib
 
