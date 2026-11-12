@@ -10,26 +10,26 @@ jobs:
     runs-on: macos-latest
 
     steps:
-    - name: Checkout Code Mã Nguồn
+    - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Biên dịch .dylib sang kiến trúc arm64 cho iOS
+    - name: Compile arm64 .dylib for iOS
       run: |
         mkdir -p build
-        clang++ -dynamiclib -Wall \
+        clang++ -dynamiclib -std=c++17 -fobjc-arc -fvisibility=hidden -Wall -Wextra \
           -arch arm64 \
-          -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+          -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
           -miphoneos-version-min=15.0 \
           -framework Foundation \
           -framework UIKit \
-          src/main.mm \
+          src/*.cpp src/*.mm \
           -o build/StickWarMod.dylib
 
-    - name: Ký số Ad-hoc (Bắt buộc để iOS/TrollStore chấp nhận)
+    - name: Ad-hoc sign (required for iOS / TrollStore)
       run: |
-        codesign -s - build/StickWarMod.dylib
+        codesign -f -s - build/StickWarMod.dylib
 
-    - name: Đóng gói và Tải sản phẩm lên GitHub Artifacts
+    - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: StickWarMod-Dylib
