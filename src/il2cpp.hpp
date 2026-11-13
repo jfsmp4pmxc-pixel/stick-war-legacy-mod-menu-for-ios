@@ -39,7 +39,14 @@ bool field_get(void *object, void *field, void *out);
 // `params` theo quy ước IL2CPP: kiểu giá trị truyền con trỏ tới giá trị,
 // kiểu tham chiếu truyền chính con trỏ đối tượng. Trả về giá trị trả về
 // (đối tượng, hoặc nullptr với hàm void). `threw` (nếu khác null) được đặt
-// true khi game ném ngoại lệ.
-void *invoke(void *method, void *object, void **params, bool *threw);
+// true khi game ném ngoại lệ; khi đó `error` (nếu có) nhận "TênClass: thông điệp".
+void *invoke(void *method, void *object, void **params, bool *threw,
+             char *error = nullptr, size_t error_len = 0);
+
+// Tạo đối tượng managed mới (chưa chạy constructor; gọi ".ctor" bằng invoke).
+void *new_object(void *klass);
+
+// Đọc giá trị bool từ đối tượng đã box (kết quả trả về của method trả bool).
+bool unbox_bool(void *boxed, bool fallback);
 
 }  // namespace il2

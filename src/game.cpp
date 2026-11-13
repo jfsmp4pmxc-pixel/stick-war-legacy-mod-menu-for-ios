@@ -10,7 +10,8 @@ namespace game {
 namespace {
 
 // Namespace gợi ý (theo script.json: StickWar.Game.Entities.Team, StickWar.Game.Mines...).
-const char *const kNamespaces[] = {"StickWar.Game.Entities", "StickWar.Game", "StickWar", "", nullptr};
+const char *const kNamespaces[] = {"StickWar.Game.Entities", "StickWar.Game", "StickWar.Game.Levels",
+                                   "StickWar", "", nullptr};
 
 // Tên class của từng loại lính trong dump (Archidon trong game là class "Archer").
 const char *const kUnitClassNames[kUnitKindCount] = {
@@ -39,7 +40,27 @@ struct State {
     void *set_gold_method = nullptr;        // Team.set_Gold(int)
     void *build_unit_method = nullptr;      // Team.BuildUnit(Type, bool, SpawnGroup, UnitOverrides)
     void *extra_population_method = nullptr;  // GameController.SetExtraPopulation(int)
+
+    // Các đường triệu hồi dự phòng (tuỳ chọn, thiếu thì bỏ qua đường đó).
+    void *level_class = nullptr;
+    void *overrides_class = nullptr;          // UnitOverrides
+    void *level_instance_field = nullptr;     // Level.Instance (static)
+    void *level_spawn_method = nullptr;       // Level.SpawnUnit(Team, Type)
+    void *queue_unit_method = nullptr;        // Team.QueueUnit(Type)
 };
+
+// Đường gọi để tạo lính; lần thành công đầu tiên được nhớ lại.
+enum class Route { Unknown, LevelSpawn, BuildWithOverrides, Queue };
+Route g_route = Route::Unknown;
+
+const char *route_name(Route route) {
+    switch (route) {
+        case Route::LevelSpawn: return "Level.SpawnUnit";
+        case Route::BuildWithOverrides: return "Team.BuildUnit(+UnitOverrides)";
+        case Route::Queue: return "Team.QueueUnit";
+        default: return "?";
+    }
+}
 
 State g;
 char g_status[96] = "chưa khởi tạo";
@@ -118,6 +139,15 @@ bool setup() {
         g.extra_population_method = il2::find_method(g.controller_class, "SetExtraPopulation", 1);
     }
 
+    // Đường dự phòng: thiếu cái nào chỉ làm mất đường tương ứng.
+    if (!g.level_class) g.level_class = il2::find_class("Level", kNamespaces);
+    if (g.level_class) {
+        if (!g.level_instance_field) g.level_instance_field = il2::find_field(g.level_class, "Instance");
+        if (!g.level_spawn_method) g.level_spawn_method = il2::find_method(g.level_class, "SpawnUnit", 2);
+    }
+    if (!g.overrides_class) g.overrides_class = il2::find_class("UnitOverrides", kNamespaces);
+    if (!g.queue_unit_method) g.queue_unit_method = il2::find_method(g.team_class, "QueueUnit", 1);
+
     for (int i = 0; i < kUnitKindCount; i++) {
         if (!g.unit_classes[i]) g.unit_classes[i] = il2::find_class(kUnitClassNames[i], kNamespaces);
         if (!g.unit_classes[i]) say_missing(kUnitClassNames[i]);
@@ -189,6 +219,85 @@ void apply_gold_mode(Side side, GoldMode mode) {
     }
 }
 
+// Thử tạo một lính theo `route`. Trả về true nếu game trả về lính / nhận lệnh.
+static bool try_route(Route route, void *team, void *type_object) {
+    char error[200];
+    bool threw = false;
+    bool ok = false;
+
+    switch (route) {
+        case Route::LevelSpawn: {
+            // Level.Instance.SpawnUnit(Team team, Type type) -> Unit
+            // (đường mà chính game dùng để tạo lính trong màn chơi)
+            if (!g.level_instance_field || !g.level_spawn_method) return false;
+            void *level = nullptr;
+            if (!il2::static_get(g.level_instance_field, &level) || !level) return false;
+            void *params[2] = {team, type_object};
+            void *unit = il2::invoke(g.level_spawn_method, level, params, &threw, error, sizeof(error));
+            ok = !threw && unit != nullptr;
+            break;
+        }
+        case Route::BuildWithOverrides: {
+            // Team.BuildUnit(Type, bool includePopulation, SpawnGroup, UnitOverrides) -> Unit
+            // UnitOverrides phải qua constructor để có giá trị mặc định (hệ số = 1).
+            void *overrides = nullptr;
+            if (g.overrides_class) {
+                overrides = il2::new_object(g.overrides_class);
+                void *ctor = il2::find_method(g.overrides_class, ".ctor", 0);
+                if (overrides && ctor) {
+                    il2::invoke(ctor, overrides, nullptr, &threw, error, sizeof(error));
+                    if (threw) overrides = nullptr;
+                }
+            }
+            if (!overrides) return false;
+            uint8_t include_population = 1;
+            void *params[4] = {type_object, &include_population, nullptr, overrides};
+            void *unit = il2::invoke(g.build_unit_method, team, params, &threw, error, sizeof(error));
+            ok = !threw && unit != nullptr;
+            break;
+        }
+        case Route::Queue: {
+            // Team.QueueUnit(Type) -> bool: cùng đường với nút xây lính trên HUD
+            // (tốn vàng và phải chờ thời gian xây như bình thường).
+            if (!g.queue_unit_method) return false;
+            void *params[1] = {type_object};
+            void *result = il2::invoke(g.queue_unit_method, team, params, &threw, error, sizeof(error));
+            ok = !threw && il2::unbox_bool(result, true);
+            break;
+        }
+        default:
+            return false;
+    }
+
+    if (threw) {
+        char buf[260];
+        std::snprintf(buf, sizeof(buf), "%s lỗi: %s", route_name(route), error);
+        il2::log(buf);
+    }
+    return ok;
+}
+
+static bool spawn_one(void *team, void *type_object) {
+    // Đường đã từng thành công thì dùng lại trước.
+    if (g_route != Route::Unknown) {
+        if (try_route(g_route, team, type_object)) return true;
+        g_route = Route::Unknown;
+    }
+
+    static const Route kOrder[] = {Route::LevelSpawn, Route::BuildWithOverrides, Route::Queue};
+    for (Route route : kOrder) {
+        if (try_route(route, team, type_object)) {
+            g_route = route;
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "triệu hồi chạy được qua %s", route_name(route));
+            il2::log(buf);
+            return true;
+        }
+    }
+    il2::log("mọi đường triệu hồi đều thất bại");
+    return false;
+}
+
 int spawn(Side side, UnitKind kind, int count) {
     if (count <= 0 || !in_match()) return 0;
 
@@ -213,18 +322,8 @@ int spawn(Side side, UnitKind kind, int count) {
             say("không lấy được System.Type của lính");
             break;
         }
-
-        // Team.BuildUnit(Type unitType, bool includePopulation,
-        //                SpawnGroup group, UnitOverrides overrides)
-        uint8_t include_population = 1;
-        void *params[4] = {type_object, &include_population, nullptr, nullptr};
-        bool threw = false;
-        void *unit = il2::invoke(g.build_unit_method, team, params, &threw);
-        if (threw) {
-            say("Team.BuildUnit ném ngoại lệ, dừng triệu hồi");
-            break;
-        }
-        if (unit) created++;
+        if (!spawn_one(team, type_object)) break;  // mọi đường đều lỗi: dừng, tránh spam
+        created++;
     }
 
     char buf[96];

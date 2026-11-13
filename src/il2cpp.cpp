@@ -24,6 +24,11 @@ using type_get_object_fn = void *(*)(void *type);
 using field_static_get_fn = void (*)(void *field, void *value);
 using field_get_fn = void (*)(void *object, void *field, void *value);
 using runtime_invoke_fn = void *(*)(void *method, void *object, void **params, void **exc);
+using object_new_fn = void *(*)(void *klass);
+using object_get_class_fn = void *(*)(void *object);
+using object_unbox_fn = void *(*)(void *object);
+using string_chars_fn = const uint16_t *(*)(void *str);
+using string_length_fn = int (*)(void *str);
 
 struct Api {
     domain_get_fn domain_get = nullptr;
@@ -42,6 +47,12 @@ struct Api {
     field_static_get_fn field_static_get = nullptr;
     field_get_fn field_get = nullptr;
     runtime_invoke_fn runtime_invoke = nullptr;
+    // Tuỳ chọn: thiếu thì chỉ mất tính năng phụ (tạo đối tượng, đọc thông điệp lỗi).
+    object_new_fn object_new = nullptr;
+    object_get_class_fn object_get_class = nullptr;
+    object_unbox_fn object_unbox = nullptr;
+    string_chars_fn string_chars = nullptr;
+    string_length_fn string_length = nullptr;
 };
 
 Api g_api;
@@ -109,6 +120,12 @@ bool init() {
     ok &= resolve(g_api.field_static_get, "il2cpp_field_static_get_value");
     ok &= resolve(g_api.field_get, "il2cpp_field_get_value");
     ok &= resolve(g_api.runtime_invoke, "il2cpp_runtime_invoke");
+
+    g_api.object_new = reinterpret_cast<object_new_fn>(dlsym(RTLD_DEFAULT, "il2cpp_object_new"));
+    g_api.object_get_class = reinterpret_cast<object_get_class_fn>(dlsym(RTLD_DEFAULT, "il2cpp_object_get_class"));
+    g_api.object_unbox = reinterpret_cast<object_unbox_fn>(dlsym(RTLD_DEFAULT, "il2cpp_object_unbox"));
+    g_api.string_chars = reinterpret_cast<string_chars_fn>(dlsym(RTLD_DEFAULT, "il2cpp_string_chars"));
+    g_api.string_length = reinterpret_cast<string_length_fn>(dlsym(RTLD_DEFAULT, "il2cpp_string_length"));
 
     g_ok = ok;
     if (ok) log_line("IL2CPP API sẵn sàng");
@@ -181,16 +198,63 @@ bool field_get(void *object, void *field, void *out) {
     return true;
 }
 
-void *invoke(void *method, void *object, void **params, bool *threw) {
+namespace {
+
+// "TênClass: thông điệp" của ngoại lệ managed (chỉ giữ ký tự ASCII).
+void describe_exception(void *exception, char *out, size_t len) {
+    if (!out || len == 0) return;
+    out[0] = '\0';
+
+    void *klass = g_api.object_get_class ? g_api.object_get_class(exception) : nullptr;
+    const char *name = klass ? g_api.class_get_name(klass) : nullptr;
+    std::snprintf(out, len, "%s", name ? name : "ngoại lệ không rõ");
+    if (!klass || !g_api.string_chars || !g_api.string_length) return;
+
+    void *get_message = g_api.class_get_method(klass, "get_Message", 0);
+    if (!get_message) return;
+    void *inner = nullptr;
+    void *text = g_api.runtime_invoke(get_message, exception, nullptr, &inner);
+    if (!text || inner) return;
+
+    const uint16_t *chars = g_api.string_chars(text);
+    int count = g_api.string_length(text);
+    if (!chars || count <= 0) return;
+
+    size_t pos = std::strlen(out);
+    if (pos + 3 >= len) return;
+    out[pos++] = ':';
+    out[pos++] = ' ';
+    for (int i = 0; i < count && pos + 1 < len; i++) {
+        out[pos++] = (chars[i] >= 0x20 && chars[i] < 0x7f) ? static_cast<char>(chars[i]) : '?';
+    }
+    out[pos] = '\0';
+}
+
+}  // namespace
+
+void *invoke(void *method, void *object, void **params, bool *threw, char *error, size_t error_len) {
     if (threw) *threw = false;
+    if (error && error_len) error[0] = '\0';
     if (!g_ok || !method) return nullptr;
     void *exception = nullptr;
     void *result = g_api.runtime_invoke(method, object, params, &exception);
     if (exception) {
         if (threw) *threw = true;
+        describe_exception(exception, error, error_len);
         return nullptr;
     }
     return result;
+}
+
+void *new_object(void *klass) {
+    if (!g_ok || !klass || !g_api.object_new) return nullptr;
+    return g_api.object_new(klass);
+}
+
+bool unbox_bool(void *boxed, bool fallback) {
+    if (!boxed || !g_api.object_unbox) return fallback;
+    void *value = g_api.object_unbox(boxed);
+    return value ? (*static_cast<uint8_t *>(value) != 0) : fallback;
 }
 
 }  // namespace il2

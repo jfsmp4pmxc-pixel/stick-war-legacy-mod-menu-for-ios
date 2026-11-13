@@ -23,7 +23,7 @@ Mod **không hook và không vá mã**. Nó tìm class và method của game the
 | --- | --- |
 | Lấy hai phe | `GameController.Instance` → `FriendlyTeam` / `EnemyTeam` |
 | Đặt vàng | `Team.set_Gold(int)` (gọi lại mỗi 0,25 giây khi bật) |
-| Triệu hồi lính | `Team.BuildUnit(Type, bool, SpawnGroup, UnitOverrides)` |
+| Triệu hồi lính | Thử lần lượt `Level.SpawnUnit(Team, Type)`, `Team.BuildUnit(...)` với `UnitOverrides` đã khởi tạo, rồi `Team.QueueUnit(Type)`; nhớ đường chạy được |
 | Nới dân số | `GameController.SetExtraPopulation(int)` |
 
 Vì tìm theo tên, bản cập nhật game không làm hỏng mod trừ khi nhà phát hành đổi tên các class/method trên. Các tên này lấy từ dump IL2CPP (RVA của bản đã dump chỉ để tham khảo: `Team.set_Gold` 0x38FAAF4, `Team.BuildUnit` 0x38F6188, `GameController.SetExtraPopulation` 0x3A017A8).
@@ -59,4 +59,4 @@ Mở menu → **Xem log**. Dòng trạng thái đầu menu cho biết:
 
 - `IL2CPP ✗`: không tìm thấy các hàm `il2cpp_*` trong tiến trình (bản game đã ẩn symbol). Gửi log để xử lý tiếp.
 - `chưa thấy class của game` hoặc `thiếu field/method của game`: tên class/method khác với dump, log sẽ ghi rõ tên nào thiếu.
-- `Team.BuildUnit ném ngoại lệ`: game từ chối tham số khi triệu hồi (thường do thiếu SpawnGroup/UnitOverrides). Gửi log để chỉnh.
+- `... lỗi: <Tên ngoại lệ>: <thông điệp>`: game từ chối một đường triệu hồi; log ghi rõ lý do. Gửi log để chỉnh.
