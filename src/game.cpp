@@ -47,6 +47,8 @@ struct State {
     void *level_instance_field = nullptr;     // Level.Instance (static)
     void *level_spawn_method = nullptr;       // Level.SpawnUnit(Team, Type)
     void *queue_unit_method = nullptr;        // Team.QueueUnit(Type)
+    void *get_gold_method = nullptr;          // Team.get_Gold()
+    void *queue_count_method = nullptr;       // Team.NumberOfUnitsInBuildQueue(Type)
 
     // Nút xây lính của HUD (chỉ cho phe ta): Hud.Instance.BuildXxx().
     void *hud_class = nullptr;
@@ -62,6 +64,18 @@ struct State {
 const char *const kHudBuildMethods[kUnitKindCount] = {
     "BuildMiner", "BuildSwordwrath", "BuildArcher", "BuildSpearton", "BuildMagikill", "BuildGiant",
 };
+
+// Triệu hồi "miễn phí": tạm đặt vàng rất cao rồi trả về mức cũ sau một lúc.
+using Clock = std::chrono::steady_clock;
+struct GoldRestore {
+    bool active = false;
+    int gold = 0;
+    Clock::time_point due;
+};
+GoldRestore g_restore[2];  // theo Side
+GoldMode g_gold_mode[2] = {GoldMode::Off, GoldMode::Off};
+constexpr auto kRestoreDelay = std::chrono::milliseconds(1500);
+constexpr int kExtraPopulation = 500;  // nới giới hạn dân số mỗi lần triệu hồi
 
 // Đường gọi để tạo lính; lần thành công đầu tiên được nhớ lại.
 enum class Route { Unknown, LevelSpawn, BuildWithOverrides, Queue, HudButton };
@@ -164,6 +178,10 @@ bool setup() {
     }
     if (!g.overrides_class) g.overrides_class = il2::find_class("UnitOverrides", kNamespaces);
     if (!g.queue_unit_method) g.queue_unit_method = il2::find_method(g.team_class, "QueueUnit", 1);
+    if (!g.get_gold_method) g.get_gold_method = il2::find_method(g.team_class, "get_Gold", 0);
+    if (!g.queue_count_method) {
+        g.queue_count_method = il2::find_method(g.team_class, "NumberOfUnitsInBuildQueue", 1);
+    }
 
     if (g.level_class) {
         if (!g.instant_build_field) g.instant_build_field = il2::find_field(g.level_class, "hasInstantBuild");
@@ -241,6 +259,18 @@ bool set_gold(Side side, int amount) {
 }
 
 void apply_gold_mode(Side side, GoldMode mode) {
+    const int idx = static_cast<int>(side);
+    g_gold_mode[idx] = mode;
+
+    // Trả vàng về mức trước khi triệu hồi (chỉ khi người chơi không bật chế độ ép vàng).
+    GoldRestore &restore = g_restore[idx];
+    if (mode != GoldMode::Off) {
+        restore.active = false;
+    } else if (restore.active && Clock::now() >= restore.due) {
+        restore.active = false;
+        set_gold(side, restore.gold);
+    }
+
     switch (mode) {
         case GoldMode::Infinite:
             set_gold(side, kInfiniteGold);
@@ -266,6 +296,46 @@ static void enable_instant_build() {
     if (any && !logged) {
         logged = true;
         il2::log("đã bật xây lính tức thì cho màn chơi (Level.hasInstantBuild)");
+    }
+}
+
+static int team_gold(void *team) {
+    if (!g.get_gold_method) return -1;
+    bool threw = false;
+    void *result = il2::invoke(g.get_gold_method, team, nullptr, &threw);
+    return threw ? -1 : il2::unbox_int(result, -1);
+}
+
+// Số lính loại này đang trong hàng chờ xây của phe (-1 nếu không đọc được).
+static int queued_count(void *team, void *type_object) {
+    if (!g.queue_count_method) return -1;
+    void *params[1] = {type_object};
+    bool threw = false;
+    void *result = il2::invoke(g.queue_count_method, team, params, &threw);
+    return threw ? -1 : il2::unbox_int(result, -1);
+}
+
+// Chuẩn bị cho một lượt triệu hồi: đủ vàng (rồi trả lại) và đủ chỗ dân số.
+static void prepare_spawn(Side side, void *team) {
+    const int idx = static_cast<int>(side);
+
+    if (g_gold_mode[idx] != GoldMode::Infinite) {
+        if (g_gold_mode[idx] == GoldMode::Off) {
+            GoldRestore &restore = g_restore[idx];
+            if (!restore.active) {
+                int current = team_gold(team);
+                if (current >= 0) {
+                    restore.active = true;
+                    restore.gold = current;
+                }
+            }
+            if (restore.active) restore.due = Clock::now() + kRestoreDelay;
+        }
+        set_gold(side, kInfiniteGold);
+    }
+
+    if (g.extra_population_method) {
+        extend_population(kExtraPopulation);
     }
 }
 
@@ -322,7 +392,7 @@ static bool try_route(Route route, void *team, void *type_object, UnitKind kind,
             void *result = il2::invoke(g.queue_unit_method, team, params, &threw, error, sizeof(error));
             ok = !threw && il2::unbox_bool(result, true);
             if (!threw && !ok) {
-                log_route_failure(route, "trả về false (thiếu vàng, hết dân số hoặc hàng chờ đầy?)");
+                log_route_failure(route, "game từ chối (lính này có thể không có trong màn, hoặc hàng chờ đầy)");
             }
             break;
         }
@@ -334,8 +404,12 @@ static bool try_route(Route route, void *team, void *type_object, UnitKind kind,
             void *hud = nullptr;
             if (!il2::static_get(g.hud_instance_field, &hud) || !hud) return false;
             enable_instant_build();
+            const int before = queued_count(team, type_object);
             il2::invoke(method, hud, nullptr, &threw, error, sizeof(error));
-            ok = !threw;  // hàm trả void: không biết có đủ vàng/dân số hay không
+            const int after = queued_count(team, type_object);
+            // Hàm trả void: nếu đọc được hàng chờ thì phải thấy lính được thêm vào.
+            ok = !threw && (before < 0 || after < 0 || after > before);
+            if (!threw && !ok) log_route_failure(route, "nút xây lính không nhận lệnh");
             break;
         }
         default:
@@ -353,8 +427,9 @@ static bool spawn_one(void *team, void *type_object, UnitKind kind, Side side) {
         g_route = Route::Unknown;
     }
 
-    static const Route kOrder[] = {Route::LevelSpawn, Route::BuildWithOverrides, Route::Queue,
-                                   Route::HudButton};
+    // Ưu tiên đường đi qua hàng chờ (đã chạy được, dùng được cho cả hai phe), rồi mới tới đường tạo thẳng.
+    static const Route kOrder[] = {Route::Queue, Route::HudButton, Route::LevelSpawn,
+                                   Route::BuildWithOverrides};
     for (Route route : kOrder) {
         if (try_route(route, team, type_object, kind, side)) {
             g_route = route;
@@ -384,6 +459,8 @@ int spawn(Side side, UnitKind kind, int count) {
 
     void *team = team_of(side);
     if (!team) return 0;
+
+    prepare_spawn(side, team);
 
     int created = 0;
     for (int i = 0; i < count; i++) {

@@ -298,7 +298,11 @@ static UISegmentedControl *SWMakeSegments(NSArray<NSString *> *items, NSInteger 
 
     int created = game::spawn(side, kind, count);
     NSString *label = [NSString stringWithUTF8String:game::unit_label(kind)];
-    _resultLabel.text = [NSString stringWithFormat:@"Đã triệu hồi %d/%d %@", created, count, label];
+    if (created == 0) {
+        _resultLabel.text = [NSString stringWithFormat:@"Không triệu hồi được %@: màn này có thể không có loại lính đó.", label];
+    } else {
+        _resultLabel.text = [NSString stringWithFormat:@"Đã triệu hồi %d/%d %@", created, count, label];
+    }
 }
 
 - (void)extendPopulationTapped {

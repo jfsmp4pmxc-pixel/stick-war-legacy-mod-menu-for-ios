@@ -5,7 +5,7 @@ Dylib mod cho **Stick War: Legacy** trên iOS (arm64, iOS 15+), chèn vào app b
 ## Tính năng
 
 - **Vàng**: chọn riêng cho phe ta và phe địch: Tắt / Vô hạn / Còn 9.
-- **Triệu hồi lính**: chọn phe (Ta / Địch), số lượng (1 / 5 / 10 / 25), rồi bấm loại lính: Thợ mỏ, Swordwrath, Archidon, Spearton, Magikill, Giant.
+- **Triệu hồi lính**: chọn phe (Ta / Địch), số lượng (1 / 5 / 10 / 25), rồi bấm loại lính: Thợ mỏ, Swordwrath, Archidon, Spearton, Magikill, Giant. Mod tự tạm cấp đủ vàng (rồi trả về mức cũ sau khoảng 1,5 giây), nới giới hạn dân số và bật xây tức thì cho màn chơi. Lính không có trong màn đang chơi thì game vẫn từ chối.
 - **Nới giới hạn dân số** thêm 50.
 - **Xem và sao chép log** để gửi khi cần báo lỗi.
 
@@ -23,7 +23,7 @@ Mod **không hook và không vá mã**. Nó tìm class và method của game the
 | --- | --- |
 | Lấy hai phe | `GameController.Instance` → `FriendlyTeam` / `EnemyTeam` |
 | Đặt vàng | `Team.set_Gold(int)` (gọi lại mỗi 0,25 giây khi bật) |
-| Triệu hồi lính | Thử lần lượt `Level.SpawnUnit(Team, Type)`, `Team.BuildUnit(...)` với `UnitOverrides` đã khởi tạo, rồi `Team.QueueUnit(Type)`; nhớ đường chạy được |
+| Triệu hồi lính | `Team.QueueUnit(Type)` (hàng chờ xây của game), dự phòng `Hud.BuildXxx()`, `Level.SpawnUnit` và `Team.BuildUnit`; nhớ đường chạy được |
 | Nới dân số | `GameController.SetExtraPopulation(int)` |
 
 Vì tìm theo tên, bản cập nhật game không làm hỏng mod trừ khi nhà phát hành đổi tên các class/method trên. Các tên này lấy từ dump IL2CPP (RVA của bản đã dump chỉ để tham khảo: `Team.set_Gold` 0x38FAAF4, `Team.BuildUnit` 0x38F6188, `GameController.SetExtraPopulation` 0x3A017A8).

@@ -49,6 +49,9 @@ bool field_set(void *object, void *field, void *value);
 // Tạo đối tượng managed mới (chưa chạy constructor; gọi ".ctor" bằng invoke).
 void *new_object(void *klass);
 
+// Đọc giá trị int từ đối tượng đã box (kết quả trả về của method trả int).
+int unbox_int(void *boxed, int fallback);
+
 // Đọc giá trị bool từ đối tượng đã box (kết quả trả về của method trả bool).
 bool unbox_bool(void *boxed, bool fallback);
 

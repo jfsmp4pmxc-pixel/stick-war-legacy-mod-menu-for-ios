@@ -287,6 +287,12 @@ void *new_object(void *klass) {
     return g_api.object_new(klass);
 }
 
+int unbox_int(void *boxed, int fallback) {
+    if (!boxed || !g_api.object_unbox) return fallback;
+    void *value = g_api.object_unbox(boxed);
+    return value ? *static_cast<int32_t *>(value) : fallback;
+}
+
 bool unbox_bool(void *boxed, bool fallback) {
     if (!boxed || !g_api.object_unbox) return fallback;
     void *value = g_api.object_unbox(boxed);
