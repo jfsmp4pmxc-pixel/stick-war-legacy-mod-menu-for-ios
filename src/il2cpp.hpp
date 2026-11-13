@@ -43,6 +43,9 @@ bool field_get(void *object, void *field, void *out);
 void *invoke(void *method, void *object, void **params, bool *threw,
              char *error = nullptr, size_t error_len = 0);
 
+// Ghi field của instance (kiểu giá trị truyền con trỏ tới giá trị).
+bool field_set(void *object, void *field, void *value);
+
 // Tạo đối tượng managed mới (chưa chạy constructor; gọi ".ctor" bằng invoke).
 void *new_object(void *klass);
 

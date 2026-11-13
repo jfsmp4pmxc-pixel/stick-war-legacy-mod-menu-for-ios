@@ -24,6 +24,7 @@ using type_get_object_fn = void *(*)(void *type);
 using field_static_get_fn = void (*)(void *field, void *value);
 using field_get_fn = void (*)(void *object, void *field, void *value);
 using runtime_invoke_fn = void *(*)(void *method, void *object, void **params, void **exc);
+using field_set_fn = void (*)(void *object, void *field, void *value);
 using object_new_fn = void *(*)(void *klass);
 using object_get_class_fn = void *(*)(void *object);
 using object_unbox_fn = void *(*)(void *object);
@@ -48,6 +49,7 @@ struct Api {
     field_get_fn field_get = nullptr;
     runtime_invoke_fn runtime_invoke = nullptr;
     // Tuỳ chọn: thiếu thì chỉ mất tính năng phụ (tạo đối tượng, đọc thông điệp lỗi).
+    field_set_fn field_set = nullptr;
     object_new_fn object_new = nullptr;
     object_get_class_fn object_get_class = nullptr;
     object_unbox_fn object_unbox = nullptr;
@@ -121,6 +123,7 @@ bool init() {
     ok &= resolve(g_api.field_get, "il2cpp_field_get_value");
     ok &= resolve(g_api.runtime_invoke, "il2cpp_runtime_invoke");
 
+    g_api.field_set = reinterpret_cast<field_set_fn>(dlsym(RTLD_DEFAULT, "il2cpp_field_set_value"));
     g_api.object_new = reinterpret_cast<object_new_fn>(dlsym(RTLD_DEFAULT, "il2cpp_object_new"));
     g_api.object_get_class = reinterpret_cast<object_get_class_fn>(dlsym(RTLD_DEFAULT, "il2cpp_object_get_class"));
     g_api.object_unbox = reinterpret_cast<object_unbox_fn>(dlsym(RTLD_DEFAULT, "il2cpp_object_unbox"));
@@ -200,7 +203,38 @@ bool field_get(void *object, void *field, void *out) {
 
 namespace {
 
-// "TênClass: thông điệp" của ngoại lệ managed (chỉ giữ ký tự ASCII).
+// Nối chuỗi managed (UTF-16) vào `out` dưới dạng ASCII; xuống dòng thành " | ".
+void append_managed_string(void *text, char *out, size_t len, size_t max_chars) {
+    if (!text || !g_api.string_chars || !g_api.string_length) return;
+    const uint16_t *chars = g_api.string_chars(text);
+    int count = g_api.string_length(text);
+    if (!chars || count <= 0) return;
+
+    size_t pos = std::strlen(out);
+    for (int i = 0; i < count && static_cast<size_t>(i) < max_chars && pos + 4 < len; i++) {
+        uint16_t c = chars[i];
+        if (c == '\r') continue;
+        if (c == '\n') {
+            out[pos++] = ' ';
+            out[pos++] = '|';
+            out[pos++] = ' ';
+        } else {
+            out[pos++] = (c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '?';
+        }
+    }
+    out[pos] = '\0';
+}
+
+// Gọi getter không tham số trả về string của đối tượng (get_Message, get_StackTrace).
+void *call_string_getter(void *klass, void *object, const char *getter) {
+    void *method = g_api.class_get_method(klass, getter, 0);
+    if (!method) return nullptr;
+    void *inner = nullptr;
+    void *text = g_api.runtime_invoke(method, object, nullptr, &inner);
+    return inner ? nullptr : text;
+}
+
+// "TênClass: thông điệp @ stack trace" của ngoại lệ managed (chỉ giữ ký tự ASCII).
 void describe_exception(void *exception, char *out, size_t len) {
     if (!out || len == 0) return;
     out[0] = '\0';
@@ -208,26 +242,22 @@ void describe_exception(void *exception, char *out, size_t len) {
     void *klass = g_api.object_get_class ? g_api.object_get_class(exception) : nullptr;
     const char *name = klass ? g_api.class_get_name(klass) : nullptr;
     std::snprintf(out, len, "%s", name ? name : "ngoại lệ không rõ");
-    if (!klass || !g_api.string_chars || !g_api.string_length) return;
+    if (!klass) return;
 
-    void *get_message = g_api.class_get_method(klass, "get_Message", 0);
-    if (!get_message) return;
-    void *inner = nullptr;
-    void *text = g_api.runtime_invoke(get_message, exception, nullptr, &inner);
-    if (!text || inner) return;
-
-    const uint16_t *chars = g_api.string_chars(text);
-    int count = g_api.string_length(text);
-    if (!chars || count <= 0) return;
-
-    size_t pos = std::strlen(out);
-    if (pos + 3 >= len) return;
-    out[pos++] = ':';
-    out[pos++] = ' ';
-    for (int i = 0; i < count && pos + 1 < len; i++) {
-        out[pos++] = (chars[i] >= 0x20 && chars[i] < 0x7f) ? static_cast<char>(chars[i]) : '?';
+    if (void *message = call_string_getter(klass, exception, "get_Message")) {
+        size_t pos = std::strlen(out);
+        if (pos + 3 < len) {
+            std::snprintf(out + pos, len - pos, ": ");
+            append_managed_string(message, out, len, 200);
+        }
     }
-    out[pos] = '\0';
+    if (void *trace = call_string_getter(klass, exception, "get_StackTrace")) {
+        size_t pos = std::strlen(out);
+        if (pos + 5 < len) {
+            std::snprintf(out + pos, len - pos, " @ ");
+            append_managed_string(trace, out, len, 1200);
+        }
+    }
 }
 
 }  // namespace
@@ -244,6 +274,12 @@ void *invoke(void *method, void *object, void **params, bool *threw, char *error
         return nullptr;
     }
     return result;
+}
+
+bool field_set(void *object, void *field, void *value) {
+    if (!g_ok || !object || !field || !value || !g_api.field_set) return false;
+    g_api.field_set(object, field, value);
+    return true;
 }
 
 void *new_object(void *klass) {
